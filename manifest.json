@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "长截图选区工具",
+  "version": "0.1.0",
+  "description": "跨屏框选页面或滚动容器并下载长截图",
+  "permissions": ["activeTab", "scripting", "offscreen", "downloads"],
+  "action": {"default_title": "选择长截图区域"},
+  "background": {"service_worker": "src/background/service-worker.js", "type": "module"},
+  "web_accessible_resources": [{
+    "resources": ["src/shared/*.js", "src/content/scroll-surface.js", "src/content/selection-ui.js", "src/content/capture-message-handler.js"],
+    "matches": ["<all_urls>"]
+  }]
+}

@@ -1,0 +1,252 @@
+import {createCaptureGate, runCapture} from './capture-controller.js';
+import {ERROR_CODE, makeMessage, MESSAGE} from '../shared/protocol.js';
+
+export const ERROR_MESSAGES = Object.freeze({
+  [ERROR_CODE.RESTRICTED_PAGE]: '当前页面不允许扩展执行截图。',
+  [ERROR_CODE.STALE_TASK]: '原始标签页已切换，请重新选择截图区域。',
+  [ERROR_CODE.SURFACE_CHANGED]: '页面或滚动区域已发生变化，请重新截图。',
+  [ERROR_CODE.CAPTURE_FAILED]: '截图失败，请重试。',
+  [ERROR_CODE.OUTPUT_TOO_LARGE]: '截图尺寸过大，请缩小选择区域。',
+  [ERROR_CODE.CANCELLED]: '截图已取消。',
+  [ERROR_CODE.TIMEOUT]: '截图超时，请缩小选择区域后重试。'
+});
+
+export function createChromeCaptureDeps(chromeApi, {
+  captureGate,
+  prepareEnvironment = async () => {}
+} = {}) {
+  return {
+    captureGate,
+    prepareEnvironment,
+    sendTab: (tabId, message) => chromeApi.tabs.sendMessage(tabId, message),
+    captureVisible: windowId => chromeApi.tabs.captureVisibleTab(windowId, {format: 'png'}),
+    getZoom: tabId => chromeApi.tabs.getZoom(tabId),
+    setZoom: (tabId, factor) => chromeApi.tabs.setZoom(tabId, factor),
+    sendOffscreen: message => chromeApi.runtime.sendMessage(message),
+    download: options => chromeApi.downloads.download(options),
+    async isActiveTab(tabId, windowId) {
+      const tabs = await chromeApi.tabs.query({active: true, windowId});
+      return tabs.length === 1 && tabs[0].id === tabId;
+    }
+  };
+}
+
+export function createHighQualitySessionManager({getZoom, setZoom}) {
+  const tails = new Map();
+  const enqueue = (tabId, operation) => {
+    const previous = tails.get(tabId) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(operation);
+    tails.set(tabId, next);
+    next.finally(() => {
+      if (tails.get(tabId) === next) tails.delete(tabId);
+    }).catch(() => {});
+    return next;
+  };
+  return {
+    enable(tabId) {
+      return enqueue(tabId, async () => {
+        const originalZoom = await getZoom(tabId);
+        await setZoom(tabId, 1.5);
+        return {originalZoom};
+      });
+    },
+    restore(tabId, originalZoom) {
+      if (!Number.isFinite(originalZoom)) return Promise.resolve();
+      return enqueue(tabId, () => setZoom(tabId, originalZoom));
+    }
+  };
+}
+
+function cancelledError() {
+  const error = new Error(ERROR_MESSAGES[ERROR_CODE.CANCELLED]);
+  error.code = ERROR_CODE.CANCELLED;
+  return error;
+}
+
+export function createCaptureCoordinator({capture, createDeps}) {
+  let current = null;
+
+  function start(request) {
+    const previous = current;
+    previous?.controller.abort(cancelledError());
+
+    const controller = new AbortController();
+    const entry = {controller, promise: null, taskId: request.taskId};
+    current = entry;
+    const predecessor = previous?.promise?.catch(() => {}) ?? Promise.resolve();
+    entry.promise = predecessor
+      .then(() => capture({...request, signal: controller.signal}, createDeps(request)))
+      .finally(() => {
+        if (current === entry) current = null;
+      });
+    return entry.promise;
+  }
+
+  function cancel(taskId) {
+    if (current?.taskId !== taskId) return false;
+    current.controller.abort(cancelledError());
+    return true;
+  }
+
+  return {start, cancel};
+}
+
+export function createOffscreenInitializer(chromeApi, {
+  getContexts = chromeApi.runtime?.getContexts?.bind(chromeApi.runtime),
+  matchAllClients = globalThis.clients?.matchAll?.bind(globalThis.clients)
+} = {}) {
+  let ready = null;
+  let creationInFlight = null;
+
+  async function documentExists() {
+    if (getContexts) {
+      const contexts = await getContexts({contextTypes: ['OFFSCREEN_DOCUMENT']});
+      return contexts.length > 0;
+    }
+    if (matchAllClients) {
+      const clients = await matchAllClients({type: 'window', includeUncontrolled: true});
+      return clients.some(client => client.url?.endsWith('/src/offscreen/offscreen.html'));
+    }
+    return chromeApi.offscreen?.hasDocument ? chromeApi.offscreen.hasDocument() : false;
+  }
+
+  return function prepareEnvironment(signal) {
+    if (signal?.aborted) return Promise.reject(signal.reason ?? cancelledError());
+    if (!ready) {
+      let generation;
+      generation = Promise.resolve()
+        .then(async () => {
+          if (creationInFlight) await creationInFlight;
+          const exists = await documentExists();
+          if (ready !== generation) return;
+          if (!exists) {
+            if (!creationInFlight) {
+              const creation = Promise.resolve().then(() => chromeApi.offscreen.createDocument({
+                url: 'src/offscreen/offscreen.html',
+                reasons: ['BLOBS'],
+                justification: '拼接并导出长截图'
+              }));
+              creationInFlight = creation;
+              creation.then(() => {
+                if (creationInFlight === creation) creationInFlight = null;
+              }, () => {
+                if (creationInFlight === creation) creationInFlight = null;
+              });
+            }
+            await creationInFlight;
+          }
+        });
+      ready = generation;
+    }
+
+    const generation = ready;
+    const resetGeneration = () => {
+      if (ready === generation) ready = null;
+    };
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        resetGeneration();
+        reject(signal.reason ?? cancelledError());
+      };
+      signal?.addEventListener('abort', onAbort, {once: true});
+      generation.then(value => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve(value);
+      }, error => {
+        signal?.removeEventListener('abort', onAbort);
+        resetGeneration();
+        reject(error);
+      });
+    });
+  };
+}
+
+export function registerServiceWorker(chromeApi, capture = runCapture, logger = console) {
+  const ensureOffscreen = createOffscreenInitializer(chromeApi);
+  const captureGate = createCaptureGate();
+  const highQualitySessions = createHighQualitySessionManager({
+    getZoom: tabId => chromeApi.tabs.getZoom(tabId),
+    setZoom: (tabId, factor) => chromeApi.tabs.setZoom(tabId, factor)
+  });
+  const coordinator = createCaptureCoordinator({
+    capture,
+    createDeps: () => createChromeCaptureDeps(chromeApi, {
+      captureGate,
+      prepareEnvironment: ensureOffscreen
+    })
+  });
+
+  chromeApi.action.onClicked.addListener(async tab => {
+    if (!Number.isInteger(tab?.id)) return;
+    try {
+      await chromeApi.scripting.executeScript({
+        target: {tabId: tab.id},
+        files: ['src/content/content-script.js']
+      });
+      await chromeApi.tabs.sendMessage(tab.id, makeMessage(MESSAGE.ENTER_SELECTION, null));
+    } catch {
+      await chromeApi.tabs.sendMessage(tab.id, makeMessage(MESSAGE.ERROR, null, {
+        code: ERROR_CODE.RESTRICTED_PAGE,
+        message: ERROR_MESSAGES[ERROR_CODE.RESTRICTED_PAGE]
+      })).catch(() => {});
+    }
+  });
+
+  chromeApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.source !== 'longshot') return false;
+
+    if (message.type === MESSAGE.CANCEL) {
+      coordinator.cancel(message.taskId);
+      sendResponse?.({ok: true});
+      return false;
+    }
+    if (message.type === MESSAGE.ENABLE_HIGH_QUALITY || message.type === MESSAGE.DISABLE_HIGH_QUALITY) {
+      const tabId = sender.tab?.id;
+      if (!Number.isInteger(tabId)) {
+        sendResponse({ok: false, code: ERROR_CODE.CAPTURE_FAILED,
+          message: ERROR_MESSAGES[ERROR_CODE.CAPTURE_FAILED]});
+        return false;
+      }
+      const operation = message.type === MESSAGE.ENABLE_HIGH_QUALITY
+        ? highQualitySessions.enable(tabId)
+        : highQualitySessions.restore(tabId, message.payload?.restoreZoomTo);
+      operation.then(session => sendResponse({ok: true, originalZoom: session?.originalZoom}), error => sendResponse({
+        ok: false, code: ERROR_CODE.CAPTURE_FAILED,
+        message: error?.message ?? ERROR_MESSAGES[ERROR_CODE.CAPTURE_FAILED]
+      }));
+      return true;
+    }
+    if (message.type !== MESSAGE.CAPTURE_REQUEST) return false;
+
+    const tabId = sender.tab?.id;
+    const windowId = sender.tab?.windowId;
+    if (!Number.isInteger(tabId) || !Number.isInteger(windowId)) {
+      sendResponse({ok: false, code: ERROR_CODE.CAPTURE_FAILED,
+        message: ERROR_MESSAGES[ERROR_CODE.CAPTURE_FAILED]});
+      return false;
+    }
+
+    coordinator.start({
+        taskId: message.taskId,
+        tabId,
+        windowId,
+        selection: message.payload?.selection,
+        surfaceKind: message.payload?.surfaceKind,
+        highQuality: message.payload?.highQuality === true,
+        restoreZoomTo: message.payload?.restoreZoomTo
+      })
+      .then(result => sendResponse({ok: true, ...result}))
+      .catch(async error => {
+        logger.error('长截图任务失败', error);
+        const code = ERROR_MESSAGES[error?.code] ? error.code : ERROR_CODE.CAPTURE_FAILED;
+        const userMessage = ERROR_MESSAGES[code];
+        await chromeApi.tabs.sendMessage(tabId, makeMessage(MESSAGE.ERROR, message.taskId, {
+          code, message: userMessage
+        })).catch(() => {});
+        sendResponse({ok: false, code, message: userMessage});
+      });
+    return true;
+  });
+}
+
+if (typeof chrome !== 'undefined') registerServiceWorker(chrome);
