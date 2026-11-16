@@ -71,12 +71,6 @@ export function createCaptureFeedback(ownerDocument = document) {
   return {
     host,
 
-    showProgress(frame, total) {
-      if (!Number.isFinite(frame) || !Number.isFinite(total) || total <= 0) return;
-      host.textContent = `正在截取 ${Math.min(Math.max(frame, 1), total)}/${total} 屏`;
-      host.style.visibility = 'visible';
-    },
-
     hideForCapture() { host.style.visibility = 'hidden'; },
 
     showError(message) {

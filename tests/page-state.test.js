@@ -170,7 +170,7 @@ test('PageStateGuard capture 阶段在捕获期阻止完整指针交互但保留
   assert.equal(prevented, false);
 });
 
-test('capture feedback 在滚动等待期显示进度并在捕获前隐藏', () => {
+test('capture feedback 只在错误/提示时显示，捕获前隐藏（不再显示截屏进度）', () => {
   class Element {
     constructor(tagName = 'div') { this.tagName = tagName; this.style = {}; this.children = []; this.textContent = ''; }
     append(...items) {
@@ -184,11 +184,9 @@ test('capture feedback 在滚动等待期显示进度并在捕获前隐藏', () 
     documentElement: root,
     createElement: tagName => new Element(tagName)
   });
-  feedback.showProgress(2, 5);
-  assert.equal(feedback.host.style.visibility, 'visible');
-  assert.equal(feedback.host.textContent, '正在截取 2/5 屏');
-  feedback.showProgress(9, 5);
-  assert.equal(feedback.host.textContent, '正在截取 5/5 屏');
+  // 进度显示已移除：feedback 没有 showProgress
+  assert.equal(typeof feedback.showProgress, 'undefined');
+  assert.equal(feedback.host.style.visibility, 'hidden');
   feedback.hideForCapture();
   assert.equal(feedback.host.style.visibility, 'hidden');
   feedback.showError('页面内容发生变化，请重新截取');

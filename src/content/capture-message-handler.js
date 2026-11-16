@@ -155,7 +155,7 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
       }
       if (message.type === MESSAGE.SCROLL_TO) {
         capture.guard.assertStable();
-        capture.feedback.showProgress(Math.min(++capture.frame, capture.total), capture.total);
+        capture.frame += 1;
         capture.surface.setScrollTop(message.payload?.top);
         // 首屏等图片，后续屏只等两帧（懒加载图片在长图里本就随滚动才触发，逐屏等待收益低）。
         await settleAfterScroll({waitImages: capture.frame === 1});

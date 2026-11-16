@@ -13,7 +13,7 @@ test('生产消息处理器确认 active/stale restore，拒绝 stale 改动并�
     setRepeatedElementsVisible(value) { events.push(`fixed:${value}`); }
     restore() { events.push('restore'); }
   }
-  const feedback = {showProgress: () => events.push('progress'), hideForCapture: () => events.push('hide'), remove: () => events.push('remove')};
+  const feedback = {hideForCapture: () => events.push('hide'), remove: () => events.push('remove')};
   const surface = {setScrollTop: top => { events.push(`scroll:${top}`); }, restore: () => events.push('surfaceRestore')};
   const handler = createCaptureMessageHandler({MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0, 50],
     createCaptureFeedback: () => feedback, controller: {enterSelection() {}}, document: {}});
@@ -24,7 +24,7 @@ test('生产消息处理器确认 active/stale restore，拒绝 stale 改动并�
   await handler.handle({type: MESSAGE.PREPARE_CAPTURE, taskId: 'active'});
   await handler.handle({type: MESSAGE.SET_FIXED_VISIBILITY, taskId: 'active', payload: {visible: false}});
   await handler.handle({type: MESSAGE.SCROLL_TO, taskId: 'active', payload: {top: 50}});
-  assert.deepEqual(events.slice(-6), ['fixed:false', 'hide', 'stable', 'progress', 'scroll:50', 'stable']);
+  assert.deepEqual(events.slice(-5), ['fixed:false', 'hide', 'stable', 'scroll:50', 'stable']);
   assert.equal((await handler.handle({type: MESSAGE.RESTORE_PAGE, taskId: 'active'})).ok, true);
   assert.ok(events.includes('restore'));
 });
@@ -192,7 +192,7 @@ test('离屏拼接消息（COMPOSER_*）不被页面应答，避免抢答导致�
   }
   const prepared = createCaptureMessageHandler({
     MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0],
-    createCaptureFeedback: () => ({showProgress() {}, hideForCapture() {}, remove() {}}),
+    createCaptureFeedback: () => ({hideForCapture() {}, remove() {}}),
     controller: {enterSelection() {}}, document: {},
     settleAfterScroll: async () => {}
   });
@@ -210,7 +210,7 @@ test('SCROLL_TO 在返回指标前依次等待两帧和有界布局稳定', asyn
   }
   const handler = createCaptureMessageHandler({
     MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0],
-    createCaptureFeedback: () => ({showProgress: () => events.push('progress'), hideForCapture() {}, remove() {}}),
+    createCaptureFeedback: () => ({hideForCapture() {}, remove() {}}),
     controller: {enterSelection() {}}, document: {},
     settleAfterScroll: async () => events.push('settled')
   });
@@ -219,7 +219,7 @@ test('SCROLL_TO 在返回指标前依次等待两帧和有界布局稳定', asyn
   await handler.handle({type: MESSAGE.PREPARE_CAPTURE, taskId: 'task'});
   events.length = 0;
   await handler.handle({type: MESSAGE.SCROLL_TO, taskId: 'task', payload: {top: 25}});
-  assert.deepEqual(events, ['metrics', 'progress', 'scroll:25', 'settled', 'sticky', 'metrics']);
+  assert.deepEqual(events, ['metrics', 'scroll:25', 'settled', 'sticky', 'metrics']);
 });
 
 test('默认滚动稳定器先等一帧，再以 300ms 上限等待未完成图片', async () => {
@@ -256,7 +256,7 @@ test('SCROLL_TO 只在首屏等待图片，后续屏跳过', async () => {
   }
   const handler = createCaptureMessageHandler({
     MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0, 50, 100],
-    createCaptureFeedback: () => ({showProgress() {}, hideForCapture() {}, remove() {}}),
+    createCaptureFeedback: () => ({hideForCapture() {}, remove() {}}),
     controller: {enterSelection() {}}, document: {},
     settleAfterScroll: options => { settleOptions.push(options); return Promise.resolve(); }
   });
@@ -279,7 +279,6 @@ test('已确认捕获时再次进入选择态会等 RESTORE_PAGE 后再恢复并
   }
   const feedback = {
     remove: () => events.push('feedbackRemove'),
-    showProgress: () => events.push('feedbackShow'),
     hideForCapture: () => events.push('feedbackHide')
   };
   const handler = createCaptureMessageHandler({
@@ -313,7 +312,6 @@ test('真实截图调用前 SCROLL_TO 与 SET_FIXED_VISIBILITY 会保持反馈�
   }
   const handler = createCaptureMessageHandler({MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0],
     createCaptureFeedback: () => ({
-      showProgress: () => { feedbackVisible = true; events.push('feedbackShow'); },
       hideForCapture: () => { feedbackVisible = false; events.push('feedbackHide'); },
       remove() {}
     }),
@@ -343,8 +341,8 @@ test('真实截图调用前 SCROLL_TO 与 SET_FIXED_VISIBILITY 会保持反馈�
   ].includes(event)), [
     MESSAGE.SCROLL_TO, MESSAGE.SET_FIXED_VISIBILITY, 'capture'
   ]);
-  assert.deepEqual(events.slice(0, 6), [
-    MESSAGE.PREPARE_CAPTURE, MESSAGE.SCROLL_TO, 'feedbackShow', MESSAGE.SET_FIXED_VISIBILITY,
+  assert.deepEqual(events.slice(0, 5), [
+    MESSAGE.PREPARE_CAPTURE, MESSAGE.SCROLL_TO, MESSAGE.SET_FIXED_VISIBILITY,
     'feedbackHide', 'capture'
   ]);
 });
