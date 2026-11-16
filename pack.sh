@@ -2,20 +2,29 @@
 # 打包 Chrome 扩展为 CRX + ZIP（Windows 环境，用 PowerShell 压缩，无需 zip 命令）。
 #
 # 用法：
-#   ./pack.sh                      # 私钥缺失时自动生成 longshot.pem，输出 longshot.crx + longshot.zip
-#   PRIVATE_KEY_FILE=my.pem ./pack.sh
+#   ./pack.sh                                   # 私钥缺失时自动生成，输出 longshot.crx + longshot.zip
+#   PRIVATE_KEY_FILE=/path/to/my.pem ./pack.sh
 #
 # - CRX：内部分发（企业策略安装 / 拖入 chrome://extensions）。
 # - ZIP：Chrome 应用商店上架用（商店不需要 crx）。
-# - longshot.pem 决定扩展 ID，务必妥善保管；换钥 = 换 ID。
+# - 私钥决定扩展 ID，务必妥善保管；换钥 = 换 ID。
+#
+# 重要：私钥必须放在扩展目录【之外】。Chrome 加载/打包扩展时会扫描扩展根目录，
+# 一旦发现 *.pem 就会弹出「此扩展程序包含密钥文件……您最好不要执行此操作」的警告。
 set -euo pipefail
 
 CHROME="${CHROME:-/c/Program Files/Google/Chrome/Application/chrome.exe}"
-KEY_FILE="${PRIVATE_KEY_FILE:-longshot.pem}"
+# 默认放到扩展目录同级的 screenshot-keys/ 下，避免被 Chrome 扫到
+DEFAULT_KEY_DIR="$(dirname "$PWD")/screenshot-keys"
+KEY_FILE="${PRIVATE_KEY_FILE:-$DEFAULT_KEY_DIR/longshot.pem}"
 OUT_CRX="${OUTPUT:-longshot.crx}"
 OUT_ZIP="${ZIP_NAME:-longshot.zip}"
 
 [ -x "$CHROME" ] || { echo "未找到 Chrome：$CHROME（可用 CHROME=路径 覆盖）"; exit 1; }
+case "$KEY_FILE" in
+  "$PWD"/*) echo "警告：私钥位于扩展目录内，Chrome 会提示「包含密钥文件」。建议移到目录之外。" >&2 ;;
+esac
+mkdir -p "$(dirname "$KEY_FILE")" 
 
 WIN() { cygpath -w "$1"; }
 
@@ -53,7 +62,7 @@ sleep 2
 if [ -f "$(dirname "$PWD")/$BASE.crx" ]; then
   mv -f "$(dirname "$PWD")/$BASE.crx" "$OUT_CRX"
 fi
-# Chrome 生成的新私钥收拢到约定文件名
+# Chrome 生成的新私钥收拢到约定位置（扩展目录之外）
 NEW_KEY="$(dirname "$PWD")/$BASE.pem"
 if [ -f "$NEW_KEY" ] && [ ! -f "$KEY_FILE" ]; then
   mv -f "$NEW_KEY" "$KEY_FILE"
