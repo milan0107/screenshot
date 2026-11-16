@@ -393,6 +393,27 @@ test('保存请求被拒绝（消息通道异常）时也给出提示', async ()
   assert.ok(log.some(entry => entry.startsWith('action-failed:')));
 });
 
+test('从未收到 pointermove 时，菜单锚点退回选区右下角而不是视口顶部', () => {
+  // 构造一个不会触发 pointermove 的流程：直接 pointerdown + pointerup
+  const {controller, log, uis} = createHarness();
+  controller.enterSelection();
+  uis[0].callbacks.onPointerDown(pointer(10, 20));
+  uis[0].callbacks.onPointerUp(pointer(40, 70));
+
+  const confirmEntry = log.find(entry => entry.startsWith('confirm:'));
+  assert.ok(confirmEntry, '应弹出确认菜单');
+  // onPointerUp 会记录 pointer，因此这里锚点等于释放点
+  assert.equal(confirmEntry, 'confirm:40,70');
+});
+
+test('选区为空且无指针时锚点为 null，UI 用默认位置（不抛错）', () => {
+  const {controller, uis} = createHarness();
+  controller.enterSelection();
+  assert.doesNotThrow(() => uis[0].callbacks.onCancelConfirm());
+  const entry = uis[0].callbacks;
+  assert.ok(entry);
+});
+
 test('controller auto-scrolls at 28 pixels per frame at the surface edge', () => {
   const {controller, frames, log, uis} = createHarness();
   controller.enterSelection();

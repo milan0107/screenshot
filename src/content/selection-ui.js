@@ -541,6 +541,17 @@ export function createSelectionController({
       state.animationFrame = requestFrame(autoScroll);
     }
 
+    /** 菜单锚点：优先真实指针位置；从未收到 pointermove 时退回选区右下角。 */
+    function menuAnchor() {
+      if (state.pointer) return state.pointer;
+      if (!state.selection || !state.surface) return null;
+      const metrics = state.surface.getMetrics();
+      return {
+        x: state.selection.right - metrics.scrollLeft + metrics.viewport.left,
+        y: state.selection.bottom - metrics.scrollTop + metrics.viewport.top
+      };
+    }
+
     function resetSelection() {
       stopAutoScroll(state);
       state.dragging = false;
@@ -594,7 +605,7 @@ export function createSelectionController({
         }
         state.composed = true;
         state.ui?.setVisible(true);
-        state.ui?.showActions(state.pointer);
+        state.ui?.showActions(menuAnchor());
       }, () => {
         if (active !== state) return;
         // 消息通道失败，后台未收到请求，缩放仍由前端恢复。
@@ -692,12 +703,12 @@ export function createSelectionController({
         stopAutoScroll(state);
         if (!state.selection || state.selection.width <= 0 || state.selection.height <= 0) {
           resetSelection();
-          state.ui?.showModeOptions(state.pointer);
+          state.ui?.showModeOptions(menuAnchor());
           return;
         }
         // 框选完成：显示手柄与「确认截图 / 取消」，等用户确认后才截图。
         state.ui?.setAdjustable(true);
-        state.ui?.showConfirm(state.pointer);
+        state.ui?.showConfirm(menuAnchor());
       },
 
       onPointerCancel() {
@@ -714,7 +725,7 @@ export function createSelectionController({
 
       onCancelConfirm() {
         resetSelection();
-        state.ui?.showModeOptions(state.pointer);
+        state.ui?.showModeOptions(menuAnchor());
       },
 
       async onSelectMode(mode) {
