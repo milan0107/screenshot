@@ -52,7 +52,8 @@
       randomUUID: () => crypto.randomUUID(), sendMessage: message => chrome.runtime.sendMessage(message),
       requestAnimationFrame, cancelAnimationFrame,
       onCaptureRequested: state => captureHandler?.onCaptureRequested({...state, surfaceToken: crypto.randomUUID()}),
-      onCopied: () => captureHandler?.showNotice('已复制到剪贴板')
+      onCopied: () => captureHandler?.showNotice('已复制到剪贴板'),
+      onActionFailed: message => captureHandler?.showNotice(message)
     });
     captureHandler = handler.createCaptureMessageHandler({MESSAGE: protocol.MESSAGE, PageStateGuard: scrollSurface.PageStateGuard,
       buildScrollTargets: segments.buildScrollTargets, createCaptureFeedback: selection.createCaptureFeedback,

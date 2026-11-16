@@ -388,7 +388,8 @@ export function createSelectionController({
   requestAnimationFrame: requestFrame,
   cancelAnimationFrame: cancelFrame,
   onCaptureRequested,
-  onCopied
+  onCopied,
+  onActionFailed
 }) {
   let active = null;
 
@@ -555,7 +556,7 @@ export function createSelectionController({
       state.ui?.setMode(state.highQuality);
     }
 
-    /** 框选完成后立即自动截图（不再需要“确认”按钮），只在完成后弹出菜单。 */
+    /** 用户点「确认截图」后才真正开始捕获（框选完成时只显示手柄与确认菜单）。 */
     function requestCapture() {
       if (state.taskId || state.busy) return;
       const {selection, surface} = state;
@@ -609,23 +610,33 @@ export function createSelectionController({
       if (!state.composed || state.busy) return;
       state.busy = true;
       state.ui?.setVisible(false);
-      let request;
-      try {
-        request = sendMessage(makeMessage(type, state.taskId, payload));
-      } catch {
-        disposeActive({notify: false});
-        return;
-      }
       const done = () => {
         state.busy = false;
         state.composed = false;
         state.taskId = null;
         if (active === state) disposeActive({notify: false});
       };
-      Promise.resolve(request).then(response => {
+      let request;
+      try {
+        request = sendMessage(makeMessage(type, state.taskId, payload));
+      } catch {
+        onActionFailed?.('操作失败，请重新截图');
         done();
-        if (response?.ok === true && type === MESSAGE.CAPTURE_COPY) onCopied?.();
-      }, done);
+        return;
+      }
+      Promise.resolve(request).then(response => {
+        const succeeded = response?.ok === true;
+        done();
+        if (!succeeded) {
+          // 保存/复制失败（如离屏会话失效、磁盘写入被拒）必须告知用户，不能静默关闭。
+          onActionFailed?.(response?.message ?? '操作失败，请重新截图');
+        } else if (type === MESSAGE.CAPTURE_COPY) {
+          onCopied?.();
+        }
+      }, () => {
+        onActionFailed?.('操作失败，请重新截图');
+        done();
+      });
     }
 
     state.ui = createUI({

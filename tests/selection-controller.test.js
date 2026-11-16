@@ -76,7 +76,8 @@ function createHarness({sendMessage: suppliedSendMessage} = {}) {
       log.push(`cancel-frame:${id}`);
     },
     onCaptureRequested: state => log.push(`capture-requested:${state.taskId}`),
-    onCopied: () => log.push('copied')
+    onCopied: () => log.push('copied'),
+    onActionFailed: message => log.push(`action-failed:${message}`)
   });
 
   return {controller, frames, log, messages, uis};
@@ -346,6 +347,50 @@ test('开启高清失败时保持普通画质', async () => {
   selectAndConfirm(uis[0]);
   const request = messages.find(message => message.type === MESSAGE.CAPTURE_REQUEST);
   assert.equal(request.payload.highQuality, false);
+});
+
+test('保存/复制失败时给出提示而不是静默关闭', async () => {
+  const {controller, log, uis} = createHarness({
+    sendMessage: message => Promise.resolve(
+      message.type === MESSAGE.CAPTURE_SAVE
+        ? {ok: false, code: 'CAPTURE_FAILED', message: '截图尺寸过大，请缩小选择区域。'}
+        : {ok: true}
+    )
+  });
+  controller.enterSelection();
+  selectAndConfirm(uis[0]);
+  await flush();
+
+  log.length = 0;
+  uis[0].callbacks.onSave();
+  await flush();
+
+  assert.ok(log.includes('action-failed:截图尺寸过大，请缩小选择区域。'),
+    '保存失败必须提示用户，不能静默收起 UI');
+  assert.ok(log.some(entry => entry.startsWith('remove:')));
+});
+
+test('保存请求被拒绝（消息通道异常）时也给出提示', async () => {
+  let calls = 0;
+  const {controller, log, uis} = createHarness({
+    sendMessage: message => {
+      if (message.type === MESSAGE.CAPTURE_SAVE) {
+        calls += 1;
+        return Promise.reject(new Error('message port closed'));
+      }
+      return Promise.resolve({ok: true});
+    }
+  });
+  controller.enterSelection();
+  selectAndConfirm(uis[0]);
+  await flush();
+
+  log.length = 0;
+  uis[0].callbacks.onSave();
+  await flush();
+
+  assert.equal(calls, 1);
+  assert.ok(log.some(entry => entry.startsWith('action-failed:')));
 });
 
 test('controller auto-scrolls at 28 pixels per frame at the surface edge', () => {

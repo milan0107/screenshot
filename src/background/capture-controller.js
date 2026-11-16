@@ -123,9 +123,12 @@ export function createCaptureGate({
         if (signal?.aborted) throw abortReason(signal);
         return operation();
       });
-      const result = await raceWithSignal(operationPromise, signal);
-      lastCaptureEndAt = now();
-      return result;
+      try {
+        return await raceWithSignal(operationPromise, signal);
+      } finally {
+        // 失败/取消同样占用了一次调用配额，必须记录，否则紧接着重试会再超配额。
+        lastCaptureEndAt = now();
+      }
     });
     tail = slot.catch(() => {});
     return raceWithSignal(slot, signal);

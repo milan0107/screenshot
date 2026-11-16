@@ -206,12 +206,31 @@ export function registerServiceWorker(chromeApi, capture = runCapture, logger = 
 
   /** 已完成拼接、等待用户选择保存/复制的任务；持有离屏画布，需及时释放。 */
   const compositions = new Map();
+  /** 待处理拼接结果的存活上限：超时自动丢弃，避免画布长期占用内存。 */
+  const COMPOSITION_TTL_MS = 120_000;
+
+  function clearComposition(taskId) {
+    const entry = compositions.get(taskId);
+    if (!entry) return null;
+    if (entry.expiry !== null) globalThis.clearTimeout(entry.expiry);
+    compositions.delete(taskId);
+    return entry;
+  }
 
   function abortComposition(taskId) {
-    if (!compositions.delete(taskId)) return Promise.resolve();
+    if (!clearComposition(taskId)) return Promise.resolve();
     return Promise.resolve()
       .then(() => chromeApi.runtime.sendMessage(makeMessage(MESSAGE.COMPOSER_ABORT, taskId)))
       .catch(() => {});
+  }
+
+  function trackComposition(taskId, entry) {
+    const expiry = globalThis.setTimeout(() => {
+      // 用户迟迟未选择：直接释放离屏画布。
+      void abortComposition(taskId);
+    }, COMPOSITION_TTL_MS);
+    expiry?.unref?.();
+    compositions.set(taskId, {...entry, expiry});
   }
 
   function discardAllCompositions() {
@@ -271,7 +290,7 @@ export function registerServiceWorker(chromeApi, capture = runCapture, logger = 
         sendResponse({ok: false, code: ERROR_CODE.STALE_TASK, message: ERROR_MESSAGES[ERROR_CODE.STALE_TASK]});
         return false;
       }
-      compositions.delete(message.taskId);
+      clearComposition(message.taskId);
       const deps = createChromeCaptureDeps(chromeApi, {captureGate, prepareEnvironment: ensureOffscreen});
       const task = message.type === MESSAGE.CAPTURE_SAVE
         ? saveComposition({taskId: message.taskId, format: message.payload?.format}, deps)
@@ -311,7 +330,7 @@ export function registerServiceWorker(chromeApi, capture = runCapture, logger = 
         restoreZoomTo: message.payload?.restoreZoomTo
       }))
       .then(result => {
-        compositions.set(message.taskId, {tabId, windowId});
+        trackComposition(message.taskId, {tabId, windowId});
         sendResponse({ok: true, ...result});
       })
       .catch(async error => {

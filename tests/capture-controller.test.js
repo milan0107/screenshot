@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  CAPTURE_INTERVAL_MS, copyComposition, discardComposition, runCapture, saveComposition
+  CAPTURE_INTERVAL_MS, copyComposition, createCaptureGate, discardComposition, runCapture, saveComposition
 } from '../src/background/capture-controller.js';
 import {
   createCaptureCoordinator, createChromeCaptureDeps, createHighQualitySessionManager,
@@ -329,6 +329,25 @@ test('默认截图间隔满足 Chrome 的 captureVisibleTab 频率配额（每�
   // 一旦有人把它调小（历史上曾误设为 200ms），真机上会稳定报「截图失败」。
   assert.ok(CAPTURE_INTERVAL_MS >= 500,
     `CAPTURE_INTERVAL_MS=${CAPTURE_INTERVAL_MS} 低于 Chrome 配额要求（≥500ms），会触发 captureVisibleTab 限流`);
+});
+
+test('捕获失败后仍记录时间，紧接着重试不会突破配额间隔', async () => {
+  let clock = 0;
+  const starts = [];
+  const gate = createCaptureGate({now: () => clock, sleep: async ms => { clock += ms; }});
+
+  await assert.rejects(
+    gate.run(async () => {
+      starts.push(clock);
+      clock += 20;
+      throw new Error('Failed to capture tab');
+    }),
+    /Failed to capture tab/
+  );
+  await gate.run(async () => { starts.push(clock); clock += 20; return 'ok'; });
+
+  assert.ok(starts[1] - starts[0] >= CAPTURE_INTERVAL_MS,
+    `失败后重试间隔应 ≥${CAPTURE_INTERVAL_MS}ms，实际 ${starts[1] - starts[0]}ms（否则会再次触发 Chrome 配额）`);
 });
 
 test('每次可视区截图调用至少相距 CAPTURE_INTERVAL_MS（按上次结束计）', async () => {
@@ -878,6 +897,41 @@ test('CAPTURE_DISCARD 释放离屏画布且拒绝其他标签页', async () => {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(discarded, [{ok: true}]);
   assert.ok(calls.includes(MESSAGE.COMPOSER_ABORT));
+});
+
+test('待处理的拼接结果超时后自动释放，避免画布长期占用内存', async () => {
+  let runtimeListener;
+  const timers = [];
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  globalThis.setTimeout = (fn, ms) => { timers.push({fn, ms}); return timers.length; };
+  globalThis.clearTimeout = () => {};
+  try {
+    const calls = [];
+    const chromeApi = {
+      action: {onClicked: {addListener() {}}},
+      runtime: {
+        onMessage: {addListener(l) { runtimeListener = l; }},
+        sendMessage: async m => { calls.push(m.type); return {ok: true}; }
+      },
+      tabs: {query: async () => [{id: 7}], sendMessage: async () => ({ok: true}), captureVisibleTab: async () => 'data:png'},
+      downloads: {download: async () => 1}
+    };
+    registerServiceWorker(chromeApi, async () => ({composed: true}), {error() {}});
+
+    runtimeListener({source: 'longshot', type: MESSAGE.CAPTURE_REQUEST, taskId: 'task-1', payload: {selection}},
+      {tab: {id: 7, windowId: 3}}, () => {});
+    await new Promise(resolve => realSetTimeout(resolve, 10));
+
+    const ttl = timers.find(timer => timer.ms >= 60_000);
+    assert.ok(ttl, '应为待处理拼接结果注册过期定时器');
+    ttl.fn();
+    await new Promise(resolve => realSetTimeout(resolve, 10));
+    assert.ok(calls.includes(MESSAGE.COMPOSER_ABORT), 'TTL 到期应释放离屏画布');
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
 });
 
 test('截图任务失败时会将原始异常记录到 Service Worker 控制台', async () => {
