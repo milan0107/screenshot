@@ -167,6 +167,40 @@ test('新提示会先清掉上一条提示的定时器', async () => {
   ]);
 });
 
+test('离屏拼接消息（COMPOSER_*）不被页面应答，避免抢答导致误判截图失败', async () => {
+  const handler = createCaptureMessageHandler({
+    MESSAGE, PageStateGuard: class {}, buildScrollTargets: () => [],
+    createCaptureFeedback: () => ({remove() {}}),
+    controller: {enterSelection() {}}, document: {}
+  });
+  handler.onCaptureRequested({taskId: 'task', selection: {}, surface: {restore() {}}, surfaceToken: 't'});
+
+  for (const type of [MESSAGE.COMPOSER_BEGIN, MESSAGE.COMPOSER_ADD, MESSAGE.COMPOSER_FINISH,
+    MESSAGE.COMPOSER_EXPORT, MESSAGE.COMPOSER_RELEASE, MESSAGE.COMPOSER_ABORT]) {
+    assert.equal(
+      await handler.handle({type, taskId: 'task', payload: {}}),
+      undefined,
+      `${type} 必须返回 undefined（不应答），否则会抢在离屏文档之前回 ok:false`
+    );
+  }
+  // 页面自身消息仍正常应答
+  class Guard {
+    prepare() { return {scrollTop: 0, maxScrollTop: 100, viewport: {height: 50}}; }
+    assertStable() { return {scrollTop: 0, maxScrollTop: 100, viewport: {height: 50}}; }
+    refreshRepeatedElements() {}
+    setRepeatedElementsVisible() {}
+  }
+  const prepared = createCaptureMessageHandler({
+    MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0],
+    createCaptureFeedback: () => ({showProgress() {}, hideForCapture() {}, remove() {}}),
+    controller: {enterSelection() {}}, document: {},
+    settleAfterScroll: async () => {}
+  });
+  prepared.onCaptureRequested({taskId: 'task2', selection: {top: 0, bottom: 50}, surface: {setScrollTop() {}}, surfaceToken: 't'});
+  await prepared.handle({type: MESSAGE.PREPARE_CAPTURE, taskId: 'task2'});
+  assert.equal((await prepared.handle({type: MESSAGE.SCROLL_TO, taskId: 'task2', payload: {top: 0}})).ok, true);
+});
+
 test('SCROLL_TO 在返回指标前依次等待两帧和有界布局稳定', async () => {
   const events = [];
   class Guard {

@@ -2,6 +2,10 @@
 const NOTICE_MS = 2_400;
 const SETTLE_IMAGE_WAIT_MS = 300;
 
+/** 离屏拼接消息类型；它们由 offscreen 文档处理，页面侧必须无视（不得应答）。 */
+const COMPOSER_TYPES = new Set(['COMPOSER_BEGIN', 'COMPOSER_ADD', 'COMPOSER_FINISH',
+  'COMPOSER_EXPORT', 'COMPOSER_RELEASE', 'COMPOSER_ABORT']);
+
 export async function waitForScrollSettle({
   document: ownerDocument = document,
   requestAnimationFrame: requestFrame = globalThis.requestAnimationFrame?.bind(globalThis),
@@ -91,6 +95,8 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
       showPassive(message, {transient: true});
     },
     async handle(message) {
+      // 防御：广播到达页面时不应答离屏拼接消息（否则会抢答导致后台误判截图失败）。
+      if (COMPOSER_TYPES.has(message.type)) return undefined;
       if (message.type === MESSAGE.ENTER_SELECTION) {
         if (capture) {
           if (!pendingEnterSelection) {

@@ -93,6 +93,7 @@ docs/superpowers/              设计与实施计划文档
 - **稳定性双保险**：content 侧 `PageStateGuard.assertStable()`（视口/尺寸抖动 >2px、`scrollHeight` >10px 即报错）+ 后台 `assertSurfaceInvariant()` + `surfaceToken`。
 - **固定元素去重**：首帧保留 `position: fixed` / 吸顶 `sticky`，后续帧设为 `visibility: hidden !important`，每帧重算。
 - **串行捕获**：`createCaptureGate` 保证相邻两次 `captureVisibleTab` 之间至少间隔 200ms（按**上次捕获结束**计时，滚动与解码时间与等待重叠）；同一时刻只允许一个任务，新任务会 abort 旧任务。
+- **消息通道隔离**：Service Worker 用 `chrome.runtime.sendMessage` 与离屏文档通信时是**广播**，消息同样会到达页面内容脚本。页面侧只应答发给自己的类型（`ENTER_SELECTION`/`ERROR`/`RESTORE_PAGE`/`PREPARE_CAPTURE`/`SET_FIXED_VISIBILITY`/`SCROLL_TO`/`CLIPBOARD_WRITE`），`COMPOSER_*` 一律不应答——否则会抢在离屏文档（需解码，较慢）之前回 `ok:false`，被后台误判成截图失败。
 - **串行拼接**：离屏 `ComposerSession` 是有状态机（`idle→beginning→begun→adding→…`），并发 `COMPOSER_ADD` 会因状态冲突抛 “Cannot add while adding”。因此帧的解码/绘制在后台**按序排队**（`addChain`），与主循环的滚动/捕获并行，但彼此严格串行。
 - **滚动稳定分级**：`waitForScrollSettle` 每屏先等一帧；**只有首屏**额外等待懒加载图片（上限 300ms），后续屏不再等图片 —— 长图里本就随滚动触发懒加载，逐屏等待收益极低却线性放大总耗时。
 - **恢复兜底**：`finally` 中依次结算在飞截图 → `COMPOSER_ABORT` → `RESTORE_PAGE`，每步都有超时；原始错误优先于恢复错误。
