@@ -46,11 +46,18 @@ echo "OK  $OUT_ZIP  （Chrome 应用商店上架用）"
 # 3) CRX（Chrome --pack-extension 签名）
 PARENT_WIN=$(WIN "$(dirname "$PWD")")
 BASE=$(basename "$PWD")
-rm -f "$(dirname "$PWD")/$BASE.crx" "$(dirname "$PWD")/$BASE.pem"
+# 先删掉上一次的产物，避免 Chrome 失败时把陈旧文件误报为成功
+rm -f "$(dirname "$PWD")/$BASE.crx" "$(dirname "$PWD")/$BASE.pem" "$OUT_CRX"
 
 KEY_ARGS=()
 if [ -f "$KEY_FILE" ]; then
-  KEY_ARGS=("--pack-extension-key=$(WIN "$PWD/$KEY_FILE")")
+  # KEY_FILE 可能是绝对路径（默认在扩展目录之外），拼接前先判断
+  case "$KEY_FILE" in
+    /*) KEY_WIN=$(WIN "$KEY_FILE") ;;
+    *)  KEY_WIN=$(WIN "$PWD/$KEY_FILE") ;;
+  esac
+  KEY_ARGS=("--pack-extension-key=$KEY_WIN")
+  echo "使用私钥：$KEY_FILE"
 fi
 
 "$CHROME" \
@@ -72,9 +79,10 @@ elif [ -f "$NEW_KEY" ]; then
 fi
 
 if [ -f "$OUT_CRX" ]; then
-  echo "OK  $OUT_CRX  （内部分发用）"
+  echo "OK  $OUT_CRX  （内部分发用，$(wc -c < "$OUT_CRX") 字节）"
 else
-  echo "FAIL CRX 打包失败" >&2
+  echo "FAIL CRX 打包失败（Chrome 未生成文件）" >&2
+  echo "  排查：确认私钥路径有效、Chrome 未在运行、扩展目录不含 *.pem" >&2
   echo "  手动方式：chrome://extensions → 开发者模式 →「打包扩展程序」" >&2
   exit 1
 fi
