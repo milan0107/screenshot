@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {copyComposition, discardComposition, runCapture, saveComposition} from '../src/background/capture-controller.js';
+import {
+  CAPTURE_INTERVAL_MS, copyComposition, discardComposition, runCapture, saveComposition
+} from '../src/background/capture-controller.js';
 import {
   createCaptureCoordinator, createChromeCaptureDeps, createHighQualitySessionManager,
   ERROR_MESSAGES, registerServiceWorker
@@ -321,7 +323,15 @@ test('用户取消另存为不算失败，仍释放画布', async () => {
   assert.deepEqual(harness.events, ['composerFinish', 'download', 'composerRelease']);
 });
 
-test('每次可视区截图调用至少相距 200ms（按上次结束计）', async () => {
+test('默认截图间隔满足 Chrome 的 captureVisibleTab 频率配额（每秒最多 2 次）', () => {
+  // Chromium: kMaxCaptureVisibleTabCallsPerSecond = 2 → 两次调用开始至少间隔 500ms。
+  // 间隔按「距上次捕获结束」计，捕获本身还需时间，所以开始间隔必然 ≥ CAPTURE_INTERVAL_MS。
+  // 一旦有人把它调小（历史上曾误设为 200ms），真机上会稳定报「截图失败」。
+  assert.ok(CAPTURE_INTERVAL_MS >= 500,
+    `CAPTURE_INTERVAL_MS=${CAPTURE_INTERVAL_MS} 低于 Chrome 配额要求（≥500ms），会触发 captureVisibleTab 限流`);
+});
+
+test('每次可视区截图调用至少相距 CAPTURE_INTERVAL_MS（按上次结束计）', async () => {
   const captureTimes = [];
   const harness = makeHarness();
   harness.deps.captureVisible = async () => {
@@ -335,8 +345,8 @@ test('每次可视区截图调用至少相距 200ms（按上次结束计）', as
   await runCapture({taskId: 'task-throttle', tabId: 7, windowId: 3}, harness.deps);
   assert.equal(captureTimes.length, 3);
   for (let index = 1; index < captureTimes.length; index += 1) {
-    assert.ok(captureTimes[index] - captureTimes[index - 1] >= 200,
-      `相邻两次捕获间隔应 ≥200ms，实际 ${captureTimes[index] - captureTimes[index - 1]}ms`);
+    assert.ok(captureTimes[index] - captureTimes[index - 1] >= CAPTURE_INTERVAL_MS,
+      `相邻两次捕获开始间隔应 ≥${CAPTURE_INTERVAL_MS}ms，实际 ${captureTimes[index] - captureTimes[index - 1]}ms`);
   }
 });
 

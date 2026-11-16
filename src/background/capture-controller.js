@@ -4,9 +4,12 @@ import {ERROR_CODE, makeMessage, MESSAGE} from '../shared/protocol.js';
 import {buildScrollTargets} from '../shared/segments.js';
 
 
-// Chrome 对连续 captureVisibleTab 有内部节流；限制「距上次捕获结束」的间隔即可，
-// 相比「距上次开始」能把滚动/解码时间与等待重叠掉，每屏省 ~330ms。
-const CAPTURE_INTERVAL_MS = 200;
+// Chrome 对 captureVisibleTab 有硬性频率配额：每秒最多 2 次
+// （Chromium 内 kMaxCaptureVisibleTabCallsPerSecond = 2，超出直接报错）。
+// 因此两次调用【开始】至少间隔 500ms；这里按「距上次捕获结束」计 500ms，
+// 因为捕获自身要 100-250ms，实际开始间隔 = 500 + 捕获耗时，必然满足配额，
+// 同时把滚动/解码时间与等待重叠掉。
+const CAPTURE_INTERVAL_MS = 500;
 const HIGH_QUALITY_ZOOM = 1.5;
 const TASK_TIMEOUT_MS = 60_000;
 const CLEANUP_TIMEOUT_MS = 1_000;
