@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# 打包 Chrome 扩展为 CRX + ZIP（Windows 环境，用 PowerShell 压缩，无需 zip 命令）。
+#
+# 用法：
+#   ./pack.sh                      # 私钥缺失时自动生成 longshot.pem，输出 longshot.crx + longshot.zip
+#   PRIVATE_KEY_FILE=my.pem ./pack.sh
+#
+# - CRX：内部分发（企业策略安装 / 拖入 chrome://extensions）。
+# - ZIP：Chrome 应用商店上架用（商店不需要 crx）。
+# - longshot.pem 决定扩展 ID，务必妥善保管；换钥 = 换 ID。
+set -euo pipefail
+
+CHROME="${CHROME:-/c/Program Files/Google/Chrome/Application/chrome.exe}"
+KEY_FILE="${PRIVATE_KEY_FILE:-longshot.pem}"
+OUT_CRX="${OUTPUT:-longshot.crx}"
+OUT_ZIP="${ZIP_NAME:-longshot.zip}"
+
+[ -x "$CHROME" ] || { echo "未找到 Chrome：$CHROME（可用 CHROME=路径 覆盖）"; exit 1; }
+
+WIN() { cygpath -w "$1"; }
+
+# 1) 组装干净暂存目录（只含运行所需文件，排除测试/文档/私钥）
+STAGE_WIN=$(powershell -NoProfile -Command "(New-Object -ComObject Scripting.FileSystemObject).GetSpecialFolder(2).Path + '\\longshot-stage-' + [guid]::NewGuid().ToString('N')")
+STAGE=$(cygpath -u "$STAGE_WIN")
+trap 'powershell -NoProfile -Command "Remove-Item -Recurse -Force \"\$env:TEMP\\longshot-stage-*\" -ErrorAction SilentlyContinue" >/dev/null 2>&1' EXIT
+
+mkdir -p "$STAGE/src"
+cp manifest.json package.json "$STAGE/"
+cp -r src/. "$STAGE/src/"
+find "$STAGE" -type f \( -name '*.test.js' -o -name '*.md' \) -delete
+
+# 2) ZIP（Compress-Archive 需要 .zip 后缀）
+rm -f "$OUT_ZIP"
+powershell -NoProfile -Command "Compress-Archive -Path '$(WIN "$STAGE")\\*' -DestinationPath '$(WIN "$PWD")\\$OUT_ZIP' -Force"
+echo "OK  $OUT_ZIP  （Chrome 应用商店上架用）"
+
+# 3) CRX（Chrome --pack-extension 签名）
+PARENT_WIN=$(WIN "$(dirname "$PWD")")
+BASE=$(basename "$PWD")
+rm -f "$(dirname "$PWD")/$BASE.crx" "$(dirname "$PWD")/$BASE.pem"
+
+KEY_ARGS=()
+if [ -f "$KEY_FILE" ]; then
+  KEY_ARGS=("--pack-extension-key=$(WIN "$PWD/$KEY_FILE")")
+fi
+
+"$CHROME" \
+  --pack-extension="$(WIN "$PWD")" \
+  --no-message-box \
+  ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} >/dev/null 2>&1 || true
+sleep 2
+
+if [ -f "$(dirname "$PWD")/$BASE.crx" ]; then
+  mv -f "$(dirname "$PWD")/$BASE.crx" "$OUT_CRX"
+fi
+# Chrome 生成的新私钥收拢到约定文件名
+NEW_KEY="$(dirname "$PWD")/$BASE.pem"
+if [ -f "$NEW_KEY" ] && [ ! -f "$KEY_FILE" ]; then
+  mv -f "$NEW_KEY" "$KEY_FILE"
+  echo "OK  $KEY_FILE  （新生成的扩展 ID 私钥，请妥善保管）"
+elif [ -f "$NEW_KEY" ]; then
+  rm -f "$NEW_KEY"
+fi
+
+if [ -f "$OUT_CRX" ]; then
+  echo "OK  $OUT_CRX  （内部分发用）"
+else
+  echo "FAIL CRX 打包失败" >&2
+  echo "  手动方式：chrome://extensions → 开发者模式 →「打包扩展程序」" >&2
+  exit 1
+fi
