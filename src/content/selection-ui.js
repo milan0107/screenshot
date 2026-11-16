@@ -21,6 +21,8 @@ const CONFIRM_BUTTONS = [
 
 const CONTROL_GAP = 8;
 const VIEWPORT_MARGIN = 8;
+/** 无指针锚点时的停靠边距（右上角）。 */
+const PANEL_DOCK_MARGIN = 16;
 
 /**
  * 菜单以指针为锚点：出现在指针**右下方**（左边缘对齐光标，顶边在光标下方 8px），
@@ -162,10 +164,15 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
     panel.style.display = 'flex';   // 先显示才能量到当前行组合的真实尺寸
     // 只有「从隐藏到显示」才更新锚点：显示期间不跟随鼠标（停驻）。
     if (!wasShown && point && Number.isFinite(point.x) && Number.isFinite(point.y)) anchorPoint = point;
-    if (!anchorPoint) return;       // 无锚点：沿用 CSS 默认位置（视口顶部居中）
     const size = panel.getBoundingClientRect?.() ?? {width: 0, height: 0};
-    const position = positionPanelAt(anchorPoint, size, {width: innerWidth, height: innerHeight});
     panel.style.transform = 'none';
+    if (!anchorPoint) {
+      // 没有页面内指针坐标（刚点图标，鼠标还在工具栏上）：停靠浏览器右上角。
+      panel.style.left = `${Math.max(VIEWPORT_MARGIN, innerWidth - size.width - PANEL_DOCK_MARGIN)}px`;
+      panel.style.top = `${PANEL_DOCK_MARGIN}px`;
+      return;
+    }
+    const position = positionPanelAt(anchorPoint, size, {width: innerWidth, height: innerHeight});
     panel.style.left = `${position.left}px`;
     panel.style.top = `${position.top}px`;
   }

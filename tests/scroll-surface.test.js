@@ -408,18 +408,21 @@ test('菜单只在出现时定位一次，之后停驻不跟随鼠标', () => {
     const ui = createSelectionUI({}, fakeDocument);
     const panel = ui.host.attachedShadow.children.find((child) => child.className === 'panel');
 
-    // 无指针坐标时用默认居中位置
+    // 无指针坐标（刚点图标，鼠标还在工具栏）→ 停靠浏览器右上角
     ui.showModeOptions();
     assert.equal(panel.style.display, 'flex');
-    assert.equal(panel.style.transform, undefined);
+    assert.equal(panel.style.transform, 'none');
+    const dockedLeft = Number.parseFloat(panel.style.left);
+    assert.equal(dockedLeft, 800 - 200 - 16, '应贴右边框（右侧留 16px）');
+    assert.equal(panel.style.top, '16px');
 
-    // 已显示后，任何阶段的再次调用都停驻原地（无指针坐标也不移动）
+    // 已显示后，任何阶段的再次调用都停驻原地（不因传入坐标而移动）
     ui.showModeOptions({x: 500, y: 400});
-    assert.equal(panel.style.transform, undefined);
+    assert.equal(panel.style.left, `${dockedLeft}px`);
     ui.showConfirm({x: 300, y: 200});
-    assert.equal(panel.style.transform, undefined);
+    assert.equal(panel.style.left, `${dockedLeft}px`);
     ui.showActions({x: 700, y: 550});
-    assert.equal(panel.style.transform, undefined);
+    assert.equal(panel.style.left, `${dockedLeft}px`);
 
     // 隐藏后再次显示：视为新一次出现，重新定位
     ui.hidePanel();
@@ -475,6 +478,44 @@ test('阶段切换后面板变宽时按新尺寸重新夹紧，不会被视口�
     left = Number.parseFloat(panel.style.left);
     assert.ok(left >= MARGIN && left + 420 <= 480 - MARGIN,
       `输出行应完整可见，实际 ${left}..${left + 420}（视口 480）`);
+  } finally {
+    globalThis.innerWidth = previousWidth;
+    globalThis.innerHeight = previousHeight;
+  }
+});
+
+test('无锚点时菜单停靠浏览器右上角，切换阶段变宽后仍贴右边框', () => {
+  class FakeElement {
+    constructor(tagName) {
+      this.tagName = tagName; this.children = []; this.style = {}; this.listeners = {};
+      this.dataset = {}; this.className = ''; this.textContent = '';
+    }
+    append(...c) { this.children.push(...c); }
+    addEventListener(t, l) { this.listeners[t] = l; }
+    setAttribute(n, v) { (this.attributes ??= {})[n] = v; }
+    attachShadow() { this.attachedShadow = new FakeElement('#shadow'); return this.attachedShadow; }
+    getBoundingClientRect() { return {width: this.w ?? 200, height: 42}; }
+    remove() {}
+  }
+  const doc = {documentElement: new FakeElement('html'), createElement: t => new FakeElement(t)};
+  const previousWidth = globalThis.innerWidth;
+  const previousHeight = globalThis.innerHeight;
+  globalThis.innerWidth = 1280;
+  globalThis.innerHeight = 800;
+  try {
+    const ui = createSelectionUI({}, doc);
+    const panel = ui.host.attachedShadow.children.find((c) => c.className === 'panel');
+
+    ui.showModeOptions();   // 点图标时鼠标在工具栏，页面内无指针坐标
+    assert.equal(panel.style.top, '16px');
+    assert.equal(1280 - (Number.parseFloat(panel.style.left) + 200), 16, '右侧应留 16px');
+
+    // 输出阶段更宽：仍贴右边框且完整可见
+    panel.w = 420;
+    ui.showActions();
+    const left = Number.parseFloat(panel.style.left);
+    assert.equal(1280 - (left + 420), 16, `变宽后仍应贴右边框，实际 right=${left + 420}`);
+    assert.ok(left >= 8);
   } finally {
     globalThis.innerWidth = previousWidth;
     globalThis.innerHeight = previousHeight;
