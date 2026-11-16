@@ -23,9 +23,8 @@ const CONTROL_GAP = 8;
 const VIEWPORT_MARGIN = 8;
 
 /**
- * 菜单以指针为锚点：垂直方向优先出现在指针**上方**（不遮挡刚操作的内容，整体更靠上），
- * 上方放不下再退到下方；水平方向优先右侧，放不下翻到左侧；最终夹紧到视口内。
- * 与指针之间保留 CONTROL_GAP，保证指针本身不会落在面板上。
+ * 菜单以指针为锚点：出现在指针**右下方**（左边缘对齐光标，顶边在光标下方 8px），
+ * 右/下放不下时向左/上翻转，最终夹紧到视口内。与指针保留 CONTROL_GAP。
  */
 export function positionPanelAt(point, panelSize, viewportSize) {
   const minimumLeft = VIEWPORT_MARGIN;
@@ -34,18 +33,16 @@ export function positionPanelAt(point, panelSize, viewportSize) {
   const maximumTop = Math.max(minimumTop, viewportSize.height - panelSize.height - VIEWPORT_MARGIN);
   const right = point.x + CONTROL_GAP;
   const left = point.x - CONTROL_GAP - panelSize.width;
-  const above = point.y - CONTROL_GAP - panelSize.height;
   const below = point.y + CONTROL_GAP;
+  const above = point.y - CONTROL_GAP - panelSize.height;
   const preferredLeft = right + panelSize.width <= viewportSize.width - VIEWPORT_MARGIN
     ? right
     : left >= VIEWPORT_MARGIN
       ? left
       : right;
-  const preferredTop = above >= minimumTop
-    ? above
-    : below + panelSize.height <= viewportSize.height - VIEWPORT_MARGIN
-      ? below
-      : above;
+  const preferredTop = below + panelSize.height <= viewportSize.height - VIEWPORT_MARGIN
+    ? below
+    : above;
 
   return {
     left: Math.min(maximumLeft, Math.max(minimumLeft, preferredLeft)),
@@ -117,8 +114,9 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
     .selection .handle[data-corner="w"]  { left: -6px; top: calc(50% - 5px); cursor: ew-resize; }
     .selection[data-adjustable] .handle { display: block; }
     .selection .handle { display: none; }
-    .panel { position: fixed; display: none; flex-direction: column; gap: 6px; box-sizing: border-box; left: 50%; top: 16px; transform: translateX(-50%); max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow-y: auto; padding: 8px; border-radius: 10px; background: rgba(15, 23, 42, .96); box-shadow: 0 8px 30px rgba(0,0,0,.28); font: 13px/1.2 system-ui, sans-serif; pointer-events: auto; }
-    .panel-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .panel { position: fixed; display: none; flex-direction: row; align-items: center; gap: 6px; box-sizing: border-box; left: 50%; top: 16px; transform: translateX(-50%); max-width: calc(100vw - 16px); padding: 8px; border-radius: 10px; background: rgba(15, 23, 42, .96); box-shadow: 0 8px 30px rgba(0,0,0,.28); font: 13px/1.2 system-ui, sans-serif; pointer-events: auto; }
+    .panel-separator { width: 1px; align-self: stretch; background: #334155; flex: none; }
+    .panel-row { display: flex; align-items: center; gap: 6px; flex: none; }
     .mode-row { display: flex; }
     .format-row, .actions { display: none; }
     .panel-label { color: #94a3b8; white-space: nowrap; }
@@ -149,6 +147,10 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
   actions.className = 'panel-row actions';
   const confirmRow = ownerDocument.createElement('div');
   confirmRow.className = 'panel-row confirm-row';
+  const separator1 = ownerDocument.createElement('span');
+  separator1.className = 'panel-separator';
+  const separator2 = ownerDocument.createElement('span');
+  separator2.className = 'panel-separator';
   const modeButtons = new Map();
   const formatButtons = new Map();
   let activePointerId = null;
@@ -171,11 +173,15 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
     panel.style.top = `${position.top}px`;
   }
 
+  /** 单排菜单：一次只显示一组（画质 | 格式+操作 | 确认），隐藏的分隔线一并收起。 */
   function showRows({mode, format, action, confirm}) {
     modeRow.style.display = mode ? 'flex' : 'none';
     formatRow.style.display = format ? 'flex' : 'none';
     actions.style.display = action ? 'flex' : 'none';
     confirmRow.style.display = confirm ? 'flex' : 'none';
+    const middle = format || action;
+    separator1.style.display = mode && middle ? 'flex' : 'none';
+    separator2.style.display = middle && confirm ? 'flex' : 'none';
   }
 
   const modeLabel = ownerDocument.createElement('span');
@@ -234,7 +240,7 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
     });
     confirmRow.append(button);
   }
-  panel.append(modeRow, formatRow, actions, confirmRow);
+  panel.append(modeRow, separator1, formatRow, separator2, actions, confirmRow);
 
   /** 手柄命中检测：命中时改抓选框本身（手柄在选框边缘上，遮罩收不到它的 pointerdown）。 */
   function hitHandle(event) {

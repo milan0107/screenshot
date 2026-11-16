@@ -71,7 +71,7 @@
 - 菜单动作 → `runAction(CAPTURE_SAVE/COPY/DISCARD)`，完成后 `disposeActive()`；
 - `Esc` / 关闭：未完成时发 `CANCEL`，已拼接时发 `CAPTURE_DISCARD`。
 
-`createSelectionUI` 提供三行面板（画质 / 确认 / 格式+操作）与 `setVisible()`（整体隐藏遮罩与面板）、`showModeOptions()`、`showConfirm(point)`、`showActions(point)`、`setAdjustable()`。
+`createSelectionUI` 的面板为**单排布局**（`flex-direction: row`）：画质 | 格式+操作 | 确认 三组互斥显示，组间用细分隔线；提供 `setVisible()`、`showModeOptions()`、`showConfirm(point)`、`showActions(point)`、`setAdjustable()`。
 
 **停驻定位**：面板本次会话只在第一次出现时按指针定位（无指针坐标则用视口顶部居中的 CSS 默认位）；之后画质→确认→输出的阶段切换只换行内容，位置不动；只有 `hidePanel()` 后再次显示（如取消后回画质菜单）才重新定位。不再有跟随指针与静止区逻辑。
 

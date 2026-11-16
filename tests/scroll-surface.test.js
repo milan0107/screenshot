@@ -158,18 +158,18 @@ test('adapts the page scrolling element', () => {
   }
 });
 
-test('菜单默认出现在指针右上方，越界时翻转', () => {
+test('菜单默认出现在指针右下方，越界时翻转', () => {
   const viewport = {width: 320, height: 240};
   const panelSize = {width: 100, height: 40};
 
-  // 上方放得下 → 面板底边在指针上方 8px
-  assert.deepEqual(positionPanelAt({x: 40, y: 60}, panelSize, viewport), {left: 48, top: 12});
+  // 下方放得下 → 面板顶边在指针下方 8px
+  assert.deepEqual(positionPanelAt({x: 40, y: 60}, panelSize, viewport), {left: 48, top: 68});
   // 右侧空间不足 → 翻到指针左侧
-  assert.deepEqual(positionPanelAt({x: 315, y: 60}, panelSize, viewport), {left: 207, top: 12});
-  // 上方空间不足 → 退到指针下方
-  assert.deepEqual(positionPanelAt({x: 40, y: 30}, panelSize, viewport), {left: 48, top: 38});
-  // 上、右都不足 → 左/下翻转
-  assert.deepEqual(positionPanelAt({x: 315, y: 30}, panelSize, viewport), {left: 207, top: 38});
+  assert.deepEqual(positionPanelAt({x: 315, y: 60}, panelSize, viewport), {left: 207, top: 68});
+  // 下方空间不足 → 翻到指针上方
+  assert.deepEqual(positionPanelAt({x: 40, y: 230}, panelSize, viewport), {left: 48, top: 182});
+  // 右、下都不足 → 左/上翻转
+  assert.deepEqual(positionPanelAt({x: 315, y: 235}, panelSize, viewport), {left: 207, top: 187});
 });
 
 test('菜单与指针保持间隔，避免指针落在面板上影响开始框选', () => {
@@ -178,8 +178,8 @@ test('菜单与指针保持间隔，避免指针落在面板上影响开始框�
   const point = {x: 300, y: 200};
   const {left, top} = positionPanelAt(point, panelSize, viewport);
 
-  assert.ok(left > point.x && top + panelSize.height < point.y);
-  assert.ok(left - point.x >= 8 && point.y - (top + panelSize.height) >= 8);
+  assert.ok(left > point.x && top > point.y);
+  assert.ok(left - point.x >= 8 && top - point.y >= 8);
 });
 
 test('超尺寸菜单与贴近边缘的指针也会被夹紧到视口安全边距内', () => {
@@ -187,8 +187,8 @@ test('超尺寸菜单与贴近边缘的指针也会被夹紧到视口安全边�
 
   // 面板比视口还宽 → 左边界夹紧到安全边距 8
   assert.equal(positionPanelAt({x: 780, y: 235}, {width: 900, height: 40}, viewport).left, 8);
-  // 上方不足、右侧不足 → 退到左下方
-  assert.deepEqual(positionPanelAt({x: 780, y: 30}, {width: 100, height: 40}, viewport), {left: 672, top: 38});
+  // 下方不足、右侧不足 → 翻到左上方
+  assert.deepEqual(positionPanelAt({x: 780, y: 235}, {width: 100, height: 40}, viewport), {left: 672, top: 187});
   // 指针贴左上角时不会移出安全边距
   assert.deepEqual(positionPanelAt({x: 2, y: 2}, {width: 100, height: 40}, viewport), {left: 10, top: 10});
 });
@@ -238,13 +238,15 @@ test('截图完成后才展开「格式 / 保存 / 复制 / 关闭」菜单', ()
   }, fakeDocument);
   const shadowChildren = ui.host.attachedShadow.children;
   const panel = shadowChildren.find((child) => child.className === 'panel');
-  const [modeRow, formatRow, actions] = panel.children;
+  const [modeRow, separator1, formatRow, separator2, actions] = panel.children;
   const modeButtons = modeRow.children.filter((child) => child.tagName === 'button');
   const formatButtons = formatRow.children.filter((child) => child.tagName === 'button');
   const actionButtons = actions.children.filter((child) => child.tagName === 'button');
 
   assert.equal(ui.host.shadowMode, 'closed');
   assert.deepEqual(modeRow.children.map((child) => child.textContent), ['画质', '普通', '高清']);
+  assert.equal(separator1.className, 'panel-separator');
+  assert.equal(separator2.className, 'panel-separator');
   assert.deepEqual(formatRow.children.map((child) => child.textContent), ['格式', 'PNG', 'JPG']);
   assert.deepEqual(actionButtons.map((button) => button.textContent),
     ['保存', '复制到剪贴板', '关闭']);
@@ -258,9 +260,10 @@ test('截图完成后才展开「格式 / 保存 / 复制 / 关闭」菜单', ()
   assert.equal(formatRow.style.display, 'none');
   assert.equal(actions.style.display, 'none');
 
-  // 截图完成后只显示格式行与操作行。
+  // 截图完成后单排显示「格式 + 操作」，画质行与分隔线隐藏。
   ui.showActions({x: 100, y: 100});
   assert.equal(modeRow.style.display, 'none');
+  assert.equal(separator1.style.display, 'none');
   assert.equal(formatRow.style.display, 'flex');
   assert.equal(actions.style.display, 'flex');
 
@@ -299,7 +302,7 @@ test('格式选择同步选中态，且截图期间整体隐藏扩展 UI', () =>
   try {
     const ui = createSelectionUI({}, fakeDocument);
     const panel = ui.host.attachedShadow.children.find((child) => child.className === 'panel');
-    const [modeRow, formatRow] = panel.children;
+    const [modeRow, separator1, formatRow] = panel.children;
     const [normal, highQuality] = modeRow.children.filter((child) => child.tagName === 'button');
     const [png, jpg] = formatRow.children.filter((child) => child.tagName === 'button');
 
@@ -356,7 +359,7 @@ test('菜单各阶段首次出现时定位到指针旁，越界时翻转夹紧',
   try {
     const ui = createSelectionUI({}, fakeDocument);
     const panel = ui.host.attachedShadow.children.find((child) => child.className === 'panel');
-    const [, actions] = panel.children;
+    const actions = panel.children[4];
 
     // 未定位前保持隐藏
     assert.equal(panel.style.display, undefined);
@@ -365,14 +368,14 @@ test('菜单各阶段首次出现时定位到指针旁，越界时翻转夹紧',
     assert.equal(panel.style.display, 'flex');
     assert.equal(actions.style.display, 'flex');
     assert.equal(panel.style.left, '128px');
-    assert.equal(panel.style.top, '12px');
+    assert.equal(panel.style.top, '98px');
 
     // 显示期间停驻：重复调用、切换到确认菜单都不重新定位
     ui.showActions({x: 500, y: 400});
     assert.equal(panel.style.left, '128px');
     ui.showConfirm({x: 790, y: 590});
     assert.equal(panel.style.left, '128px');
-    assert.equal(panel.style.top, '12px');
+    assert.equal(panel.style.top, '98px');
   } finally {
     globalThis.innerWidth = previousWidth;
     globalThis.innerHeight = previousHeight;
@@ -424,13 +427,13 @@ test('菜单只在出现时定位一次，之后停驻不跟随鼠标', () => {
     ui.showModeOptions({x: 120, y: 90});
     assert.equal(panel.style.transform, 'none');
     assert.equal(panel.style.left, '128px');
-    assert.equal(panel.style.top, '42px');
+    assert.equal(panel.style.top, '98px');
     ui.showConfirm({x: 600, y: 500});
     assert.equal(panel.style.left, '128px');
-    assert.equal(panel.style.top, '42px');
+    assert.equal(panel.style.top, '98px');
     ui.showActions({x: 50, y: 50});
     assert.equal(panel.style.left, '128px');
-    assert.equal(panel.style.top, '42px');
+    assert.equal(panel.style.top, '98px');
   } finally {
     globalThis.innerWidth = previousWidth;
     globalThis.innerHeight = previousHeight;
@@ -527,9 +530,7 @@ test('selection UI 的面板在窄视口下仍可完整使用', () => {
     assert.ok(Number.parseFloat(panel.style.top) >= 8);
     assert.match(style.textContent, /\.panel\s*\{[^}]*box-sizing:\s*border-box/);
     assert.match(style.textContent, /\.panel\s*\{[^}]*max-width:\s*calc\(100vw - 16px\)/);
-    assert.match(style.textContent, /\.panel\s*\{[^}]*max-height:\s*calc\(100vh - 16px\)/);
-    assert.match(style.textContent, /\.panel\s*\{[^}]*overflow-y:\s*auto/);
-    assert.match(style.textContent, /\.panel-row\s*\{[^}]*flex-wrap:\s*wrap/);
+    assert.match(style.textContent, /\.panel\s*\{[^}]*flex-direction:\s*row/);
   } finally {
     globalThis.innerWidth = previousWidth;
     globalThis.innerHeight = previousHeight;
