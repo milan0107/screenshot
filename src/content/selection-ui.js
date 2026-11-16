@@ -148,20 +148,23 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
   const modeButtons = new Map();
   const formatButtons = new Map();
   let activePointerId = null;
+  /** 菜单锚点（首次出现时的指针位置）；阶段切换时锚点不变，仅按新尺寸重新夹紧。 */
+  let anchorPoint = null;
 
   /**
-   * 显示面板并定位到指针附近。本次会话只在第一次出现时定位，
-   * 之后（含画质→确认→输出的阶段切换）停驻原地不跟随鼠标；
-   * 隐藏后再次显示（如取消后回到画质菜单）才重新定位。
-   * 无有效指针坐标时保持 CSS 默认位置（视口顶部居中）。
+   * 显示面板并按锚点定位。锚点只在第一次出现时确定（之后停驻、不跟随鼠标）；
+   * 但每次切换阶段都要**按当前实际尺寸重新夹紧** —— 各阶段宽度差别很大
+   * （画质 ~200px、输出 ~420px），只按首次的窄宽度定位会让宽的那一版被挤出视口。
+   * 锚点不变时放得下就保持原位，只有将要溢出时才向左/上收。
    */
   function revealPanel(point) {
-    const alreadyShown = panel.style.display === 'flex';
-    panel.style.display = 'flex';
-    if (alreadyShown) return;
-    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+    const wasShown = panel.style.display === 'flex';
+    panel.style.display = 'flex';   // 先显示才能量到当前行组合的真实尺寸
+    // 只有「从隐藏到显示」才更新锚点：显示期间不跟随鼠标（停驻）。
+    if (!wasShown && point && Number.isFinite(point.x) && Number.isFinite(point.y)) anchorPoint = point;
+    if (!anchorPoint) return;       // 无锚点：沿用 CSS 默认位置（视口顶部居中）
     const size = panel.getBoundingClientRect?.() ?? {width: 0, height: 0};
-    const position = positionPanelAt(point, size, {width: innerWidth, height: innerHeight});
+    const position = positionPanelAt(anchorPoint, size, {width: innerWidth, height: innerHeight});
     panel.style.transform = 'none';
     panel.style.left = `${position.left}px`;
     panel.style.top = `${position.top}px`;
@@ -334,9 +337,10 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
       revealPanel(point);
     },
 
-    /** 框选或截图期间收起菜单。 */
+    /** 框选或截图期间收起菜单；再次出现时按新的指针位置重新定位。 */
     hidePanel() {
       panel.style.display = 'none';
+      anchorPoint = null;
     },
 
     /** 截图完成后在指针附近展开「格式 / 保存 / 复制 / 关闭」菜单。 */

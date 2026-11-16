@@ -440,6 +440,47 @@ test('菜单只在出现时定位一次，之后停驻不跟随鼠标', () => {
   }
 });
 
+test('阶段切换后面板变宽时按新尺寸重新夹紧，不会被视口右侧裁掉', () => {
+  class FakeElement {
+    constructor(tagName) {
+      this.tagName = tagName; this.children = []; this.style = {}; this.listeners = {};
+      this.dataset = {}; this.className = ''; this.textContent = '';
+    }
+    append(...c) { this.children.push(...c); }
+    addEventListener(t, l) { this.listeners[t] = l; }
+    setAttribute(n, v) { (this.attributes ??= {})[n] = v; }
+    attachShadow() { this.attachedShadow = new FakeElement('#shadow'); return this.attachedShadow; }
+    // 宽度随当前可见行变化：画质行窄，输出行宽
+    getBoundingClientRect() { return {width: this.measuredWidth ?? 200, height: 42}; }
+    remove() {}
+  }
+  const doc = {documentElement: new FakeElement('html'), createElement: t => new FakeElement(t)};
+  const previousWidth = globalThis.innerWidth;
+  const previousHeight = globalThis.innerHeight;
+  globalThis.innerWidth = 480;
+  globalThis.innerHeight = 400;
+  try {
+    const ui = createSelectionUI({}, doc);
+    const panel = ui.host.attachedShadow.children.find((c) => c.className === 'panel');
+    const MARGIN = 8;
+
+    panel.measuredWidth = 200;
+    ui.showModeOptions({x: 400, y: 100});
+    let left = Number.parseFloat(panel.style.left);
+    assert.ok(left + 200 <= 480 - MARGIN, `画质行应完整可见，实际右边缘 ${left + 200}`);
+
+    // 切到输出行（宽度 420）：锚点不变，但必须按新宽度收回视口内
+    panel.measuredWidth = 420;
+    ui.showActions({x: 400, y: 100});
+    left = Number.parseFloat(panel.style.left);
+    assert.ok(left >= MARGIN && left + 420 <= 480 - MARGIN,
+      `输出行应完整可见，实际 ${left}..${left + 420}（视口 480）`);
+  } finally {
+    globalThis.innerWidth = previousWidth;
+    globalThis.innerHeight = previousHeight;
+  }
+});
+
 test('selection UI 拖拽时只转发起始指针，无拖拽时转发悬停移动', () => {
   class FakeElement {
     constructor(tagName) {
