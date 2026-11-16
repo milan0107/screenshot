@@ -6,7 +6,7 @@ import {
 } from '../src/background/capture-controller.js';
 import {
   createCaptureCoordinator, createChromeCaptureDeps, createHighQualitySessionManager,
-  ERROR_MESSAGES, registerServiceWorker
+  createOffscreenInitializer, ERROR_MESSAGES, registerServiceWorker
 } from '../src/background/service-worker.js';
 import {ERROR_CODE, MESSAGE} from '../src/shared/protocol.js';
 
@@ -701,6 +701,66 @@ test('Chrome 依赖适配调用原始窗口、消息、截图与下载 API', asy
     ['offscreen', {type: 'OFFSCREEN'}],
     ['download', {url: 'blob:shot', filename: 'shot.png', saveAs: false}]
   ]);
+});
+
+test('离屏文档被回收时 sendOffscreen 自动重建并重试一次', async () => {
+  let alive = true;
+  let attempts = 0;
+  const chromeApi = {
+    runtime: {
+      sendMessage: async () => {
+        attempts += 1;
+        if (!alive) throw new Error('Could not establish connection. Receiving end does not exist.');
+        return {ok: true};
+      },
+      getContexts: async () => (alive ? [{}] : [])
+    },
+    offscreen: {
+      createDocument: async () => { alive = true; },
+      closeDocument: async () => { alive = false; }
+    }
+  };
+  const prepare = createOffscreenInitializer(chromeApi);
+  const deps = createChromeCaptureDeps(chromeApi, {prepareEnvironment: prepare});
+
+  assert.deepEqual(await deps.sendOffscreen({type: 'COMPOSER_BEGIN'}), {ok: true});
+
+  alive = false;
+  attempts = 0;
+  assert.deepEqual(await deps.sendOffscreen({type: 'COMPOSER_ADD'}), {ok: true});
+  assert.equal(attempts, 2, '首次失败后应重建文档并重试一次');
+  assert.equal(alive, true);
+});
+
+test('错误提示带上失败阶段与原始原因，便于定位', async () => {
+  let runtimeListener;
+  const sent = [];
+  const chromeApi = {
+    action: {onClicked: {addListener() {}}},
+    runtime: {onMessage: {addListener(l) { runtimeListener = l; }}},
+    tabs: {
+      query: async () => [{id: 7}],
+      sendMessage: async (_tabId, message) => { sent.push(message); return {ok: true}; }
+    },
+    downloads: {download: async () => 1}
+  };
+  const capture = async () => {
+    const error = new Error('Could not establish connection');
+    error.stage = 'capture#2/3';
+    throw error;
+  };
+  registerServiceWorker(chromeApi, capture, {error() {}});
+
+  const responses = [];
+  runtimeListener({source: 'longshot', type: MESSAGE.CAPTURE_REQUEST, taskId: 'task-1', payload: {selection}},
+    {tab: {id: 7, windowId: 3}}, response => responses.push(response));
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  assert.equal(responses[0].code, ERROR_CODE.CAPTURE_FAILED);
+  assert.match(responses[0].message, /capture#2\/3/);
+  assert.match(responses[0].message, /Could not establish connection/);
+  const errorMessage = sent.find(m => m.type === MESSAGE.ERROR);
+  assert.match(errorMessage.payload.message, /capture#2\/3/);
 });
 
 test('service worker 点击图标时注入脚本并进入选择态', async () => {

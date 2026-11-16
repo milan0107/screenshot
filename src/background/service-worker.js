@@ -24,7 +24,17 @@ export function createChromeCaptureDeps(chromeApi, {
     captureVisible: windowId => chromeApi.tabs.captureVisibleTab(windowId, {format: 'png'}),
     getZoom: tabId => chromeApi.tabs.getZoom(tabId),
     setZoom: (tabId, factor) => chromeApi.tabs.setZoom(tabId, factor),
-    sendOffscreen: message => chromeApi.runtime.sendMessage(message),
+    async sendOffscreen(message) {
+      try {
+        return await chromeApi.runtime.sendMessage(message);
+      } catch (error) {
+        // 离屏文档已被回收/上下文失效时重建文档并重试一次。
+        if (typeof prepareEnvironment.reset !== 'function') throw error;
+        await prepareEnvironment.reset();
+        await prepareEnvironment();
+        return chromeApi.runtime.sendMessage(message);
+      }
+    },
     download: options => chromeApi.downloads.download(options),
     async isActiveTab(tabId, windowId) {
       const tabs = await chromeApi.tabs.query({active: true, windowId});
@@ -112,7 +122,7 @@ export function createOffscreenInitializer(chromeApi, {
     return chromeApi.offscreen?.hasDocument ? chromeApi.offscreen.hasDocument() : false;
   }
 
-  return function prepareEnvironment(signal) {
+  const prepareEnvironment = function prepareEnvironment(signal) {
     if (signal?.aborted) return Promise.reject(signal.reason ?? cancelledError());
     if (!ready) {
       let generation;
@@ -161,6 +171,22 @@ export function createOffscreenInitializer(chromeApi, {
       });
     });
   };
+
+  /**
+   * 强制下次重建离屏文档。离屏文档可能被浏览器回收（或被重载扩展留下失效上下文），
+   * 此时 runtime.sendMessage 会抛 "Receiving end does not exist"。清空缓存后重建即可自愈。
+   */
+  prepareEnvironment.reset = async () => {
+    ready = null;
+    creationInFlight = null;
+    try {
+      await chromeApi.offscreen?.closeDocument?.();
+    } catch {
+      // 文档本就不存在时忽略
+    }
+  };
+
+  return prepareEnvironment;
 }
 
 export function registerServiceWorker(chromeApi, capture = runCapture, logger = console) {
@@ -291,7 +317,11 @@ export function registerServiceWorker(chromeApi, capture = runCapture, logger = 
       .catch(async error => {
         logger.error('长截图任务失败', error);
         const code = ERROR_MESSAGES[error?.code] ? error.code : ERROR_CODE.CAPTURE_FAILED;
-        const userMessage = ERROR_MESSAGES[code];
+        // CAPTURE_FAILED 时把阶段与原因带出来，否则只能看到「截图失败，请重试」无从定位。
+        const detail = code === ERROR_CODE.CAPTURE_FAILED
+          ? `（${error?.stage ?? '未知阶段'}：${error?.message ?? '未知原因'}）`
+          : '';
+        const userMessage = `${ERROR_MESSAGES[code]}${detail}`;
         await chromeApi.tabs.sendMessage(tabId, makeMessage(MESSAGE.ERROR, message.taskId, {
           code, message: userMessage
         })).catch(() => {});

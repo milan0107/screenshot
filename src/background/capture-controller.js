@@ -23,7 +23,10 @@ function codedError(code, message, cause) {
 
 function normalizeError(error) {
   if (Object.values(ERROR_CODE).includes(error?.code)) return error;
-  return codedError(ERROR_CODE.CAPTURE_FAILED, error?.message ?? String(error), error);
+  const normalized = codedError(ERROR_CODE.CAPTURE_FAILED, error?.message ?? String(error), error);
+  // 保留上游附加的阶段信息，便于把「截图失败」定位到具体步骤。
+  if (error?.stage) normalized.stage = error.stage;
+  return normalized;
 }
 
 function isUserCanceledDownload(error) {
@@ -185,6 +188,8 @@ export async function runCapture(request, deps) {
   };
   const tabMessage = message => awaitOperation(async () => responseValue(await sendTab(tabId, message)));
   const composerMessage = message => awaitOperation(async () => responseValue(await sendOffscreen(message)));
+  /** 当前执行阶段；失败时随错误上报，便于定位（见 service-worker 的错误文案）。 */
+  let stage = 'init';
   const applyHighQualityZoom = async () => {
     if (restoreZoom) return;
     if (request.highQuality !== true) return;
@@ -201,9 +206,12 @@ export async function runCapture(request, deps) {
   };
   try {
     await ensureActive();
+    stage = 'offscreen';
     await awaitOperation(() => prepareEnvironment(signal));
+    stage = 'zoom';
     await awaitOperation(applyHighQualityZoom);
     await ensureActive();
+    stage = 'prepare';
     const prepared = await tabMessage(makeMessage(MESSAGE.PREPARE_CAPTURE, taskId, {
       selection: request.selection,
       surfaceKind: request.surfaceKind
@@ -230,6 +238,7 @@ export async function runCapture(request, deps) {
     };
 
     for (let index = 0; index < targets.length; index += 1) {
+      stage = `scroll#${index + 1}/${targets.length}`;
       const top = targets[index];
       const scrolled = await tabMessage(makeMessage(MESSAGE.SCROLL_TO, taskId, {top}));
       assertSurfaceInvariant(prepared, scrolled);
@@ -237,6 +246,7 @@ export async function runCapture(request, deps) {
 
       checkCancellation();
       await ensureActive();
+      stage = `capture#${index + 1}/${targets.length}`;
       const dataUrl = await awaitOperation(() =>
         captureGate.run(() => {
           inFlightCapture = Promise.resolve().then(() => captureVisible(windowId));
@@ -267,6 +277,7 @@ export async function runCapture(request, deps) {
       queueAdd(makeMessage(MESSAGE.COMPOSER_ADD, taskId, {dataUrl, placement}));
     }
 
+    stage = 'compose';
     await addChain;
     if (addError) throw normalizeError(addError);
 
@@ -274,6 +285,7 @@ export async function runCapture(request, deps) {
     return {composed: true};
   } catch (error) {
     captureError = normalizeError(error);
+    if (!captureError.stage) captureError.stage = stage;
   } finally {
     clearTimeout(timer);
     externalSignal?.removeEventListener('abort', onExternalAbort);
