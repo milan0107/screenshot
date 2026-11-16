@@ -92,12 +92,17 @@ test('首帧按 begin 再 add 编排，拼接完成后不下载也不释放画�
   const result = await runCapture({taskId: 'task-1', tabId: 7, windowId: 3}, deps);
 
   assert.deepEqual(result, {composed: true});
-  assert.deepEqual(events, [
-    'prepare', 'scroll', 'fixed:true', 'capture', 'composerBegin', 'composerAdd',
-    'scroll', 'fixed:false', 'sleep:200', 'capture', 'composerAdd',
-    'scroll', 'fixed:false', 'sleep:200', 'capture', 'composerAdd',
-    'restore'
-  ]);
+  // add 与下一屏滚动并行，事件交错顺序不确定，这里断言语义不变量。
+  assert.equal(events[0], 'prepare');
+  assert.equal(events.at(-1), 'restore');
+  assert.equal(events.filter(e => e === 'capture').length, 3);
+  assert.equal(events.filter(e => e === 'scroll').length, 3);
+  assert.equal(events.filter(e => e === 'composerAdd').length, 3);
+  assert.equal(events.filter(e => e === 'composerBegin').length, 1);
+  assert.deepEqual(events.filter(e => e.startsWith('fixed:')), ['fixed:true', 'fixed:false', 'fixed:false']);
+  // begin 必须在所有 add 之前；首帧的 fixed 可见性切换在首帧捕获前。
+  assert.ok(events.indexOf('composerBegin') < events.indexOf('composerAdd'));
+  assert.ok(events.indexOf('fixed:true') < events.indexOf('capture'));
   assert.equal(events.includes('download'), false);
   assert.equal(events.includes('composerFinish'), false);
   assert.equal(events.includes('composerRelease'), false);
@@ -113,6 +118,26 @@ test('首帧按 begin 再 add 编排，拼接完成后不下载也不释放画�
     sx: 20, sy: 0, sw: 400, sh: 1200,
     dx: 0, dy: 0, dw: 400, dh: 1200
   });
+});
+
+test('多帧 COMPOSER_ADD 严格串行发送，不会并发进入拼接状态机', async () => {
+  const harness = makeHarness();
+  const inFlight = [];
+  let maxConcurrent = 0;
+  const baseSendOffscreen = harness.deps.sendOffscreen;
+  harness.deps.sendOffscreen = async message => {
+    if (message.type !== MESSAGE.COMPOSER_ADD) return baseSendOffscreen(message);
+    inFlight.push(message.payload.placement.dy);
+    maxConcurrent = Math.max(maxConcurrent, inFlight.length);
+    // 模拟解码/绘制耗时，若主循环并发发送，后续帧会在此重叠
+    await new Promise(resolve => setTimeout(resolve, 10));
+    inFlight.pop();
+    return baseSendOffscreen(message);
+  };
+
+  await runCapture({taskId: 'task-serial-add', tabId: 7, windowId: 3}, harness.deps);
+
+  assert.equal(maxConcurrent, 1, '同一时刻只允许一个 COMPOSER_ADD 在飞');
 });
 
 test('截图完成后由用户选择保存：按所选格式编码、下载并释放画布', async () => {

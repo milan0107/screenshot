@@ -214,8 +214,17 @@ export async function runCapture(request, deps) {
     });
     let scaleX;
     let scaleY;
-    const addTasks = [];
-    const addErrors = [];
+    // 帧解码/绘制必须串行（离屏 ComposerSession 是有状态机，并发 add 会冲突），
+    // 但不阻塞主循环：主循环只管滚动与捕获，add 在后台按序排队，最后统一等待。
+    let addChain = Promise.resolve();
+    let addError = null;
+    const queueAdd = message => {
+      addChain = addChain.then(() => {
+        if (addError) return undefined;
+        return composerMessage(message).catch(error => { addError ??= error; });
+      });
+      return addChain;
+    };
 
     for (let index = 0; index < targets.length; index += 1) {
       const top = targets[index];
@@ -252,16 +261,11 @@ export async function runCapture(request, deps) {
         scaleY
       });
       if (!placement) throw codedError(ERROR_CODE.SURFACE_CHANGED, '截图区域已移出可见范围');
-      // add 的解码/绘制与下一屏的滚动并行；composer 端按消息到达顺序处理，
-      // 主循环只在本屏数据发出后立即推进下一屏。
-      addTasks.push(
-        composerMessage(makeMessage(MESSAGE.COMPOSER_ADD, taskId, {dataUrl, placement}))
-          .then(() => {}, error => { addErrors.push(error); })
-      );
+      queueAdd(makeMessage(MESSAGE.COMPOSER_ADD, taskId, {dataUrl, placement}));
     }
 
-    await Promise.all(addTasks);
-    if (addErrors.length) throw normalizeError(addErrors[0]);
+    await addChain;
+    if (addError) throw normalizeError(addError);
 
     // 拼接完成即返回：保存/复制由用户在菜单里选择后再触发，拼接画布继续保留在离屏文档中。
     return {composed: true};

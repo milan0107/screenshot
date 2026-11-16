@@ -92,7 +92,8 @@ docs/superpowers/              设计与实施计划文档
 - **实测坐标**：裁剪缩放比取自 `bitmap.width / innerWidth`，拼接偏移用每帧**实际** `scrollTop` 反算，不假设设置值生效。
 - **稳定性双保险**：content 侧 `PageStateGuard.assertStable()`（视口/尺寸抖动 >2px、`scrollHeight` >10px 即报错）+ 后台 `assertSurfaceInvariant()` + `surfaceToken`。
 - **固定元素去重**：首帧保留 `position: fixed` / 吸顶 `sticky`，后续帧设为 `visibility: hidden !important`，每帧重算。
-- **串行捕获**：`createCaptureGate` 保证相邻两次 `captureVisibleTab` 之间至少间隔 200ms（按**上次捕获结束**计时，滚动与解码时间与等待重叠）；帧的解码绘制与下一屏滚动并行执行；同一时刻只允许一个任务，新任务会 abort 旧任务。
+- **串行捕获**：`createCaptureGate` 保证相邻两次 `captureVisibleTab` 之间至少间隔 200ms（按**上次捕获结束**计时，滚动与解码时间与等待重叠）；同一时刻只允许一个任务，新任务会 abort 旧任务。
+- **串行拼接**：离屏 `ComposerSession` 是有状态机（`idle→beginning→begun→adding→…`），并发 `COMPOSER_ADD` 会因状态冲突抛 “Cannot add while adding”。因此帧的解码/绘制在后台**按序排队**（`addChain`），与主循环的滚动/捕获并行，但彼此严格串行。
 - **滚动稳定分级**：`waitForScrollSettle` 每屏先等一帧；**只有首屏**额外等待懒加载图片（上限 300ms），后续屏不再等图片 —— 长图里本就随滚动触发懒加载，逐屏等待收益极低却线性放大总耗时。
 - **恢复兜底**：`finally` 中依次结算在飞截图 → `COMPOSER_ABORT` → `RESTORE_PAGE`，每步都有超时；原始错误优先于恢复错误。
 - **两段式任务**：`CAPTURE_REQUEST` 只负责拼接，完成后不下载、不释放画布，并把 `taskId` 登记到 Service Worker 的 `compositions`；用户随后发 `CAPTURE_SAVE`（按格式下载）/ `CAPTURE_COPY`（写剪贴板）/ `CAPTURE_DISCARD`（丢弃）时才真正消费，每条任务只能消费一次，标签页关闭或新任务开始时自动丢弃。
