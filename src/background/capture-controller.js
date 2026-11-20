@@ -26,19 +26,28 @@ function normalizeError(error) {
   const normalized = codedError(ERROR_CODE.CAPTURE_FAILED, error?.message ?? String(error), error);
   // 保留上游附加的阶段信息，便于把「截图失败」定位到具体步骤。
   if (error?.stage) normalized.stage = error.stage;
+  if (error?.details) normalized.details = error.details;
   return normalized;
 }
 
 function isUserCanceledDownload(error) {
-  return error === 'USER_CANCELED'
-    || error?.code === 'USER_CANCELED'
-    || error?.message === 'USER_CANCELED';
+  // Chrome 不同版本/本地化的报错文案不一致（USER_CANCELED、User canceled、
+  // User cancelled、Download canceled by the user 等），不能只做精确匹配，
+  // 否则用户点了「取消」会被误报为保存失败并丢掉截图。
+  if (error === 'USER_CANCELED' || error?.code === 'USER_CANCELED') return true;
+  const text = `${error?.message ?? (typeof error === 'string' ? error : '')}`.toLowerCase();
+  return text.includes('user_canceled')
+    || text.includes('user cancel')
+    || text.includes('canceled by the user')
+    || text.includes('cancelled by the user');
 }
 
 function responseValue(response) {
   if (response?.ok === true) return response;
   if (response?.ok === false) {
-    throw codedError(response.code ?? ERROR_CODE.CAPTURE_FAILED, response.message ?? '操作失败');
+    const error = codedError(response.code ?? ERROR_CODE.CAPTURE_FAILED, response.message ?? '操作失败');
+    if (response.details) error.details = response.details;
+    throw error;
   }
   throw codedError(ERROR_CODE.CAPTURE_FAILED, '未收到有效响应');
 }
@@ -46,17 +55,45 @@ function responseValue(response) {
 function assertSurfaceInvariant(prepared, current) {
   const original = prepared.metrics;
   const next = current.metrics;
-  const sameViewport = ['left', 'top', 'width', 'height']
-    .every(key => next?.viewport?.[key] === original?.viewport?.[key]);
-  const withinTolerance = (before, after) => before === undefined || after === undefined
-    || Math.abs(after - before) <= SURFACE_METRIC_TOLERANCE;
-  if (current.surfaceToken !== prepared.surfaceToken
-    || !withinTolerance(original?.maxScrollTop, next?.maxScrollTop)
-    || !withinTolerance(original?.scrollHeight, next?.scrollHeight)
-    || next?.scrollLeft !== original?.scrollLeft
-    || !sameViewport) {
-    throw codedError(ERROR_CODE.SURFACE_CHANGED, '截图区域在捕获过程中发生变化');
+  const changes = [];
+  const compare = (label, before, after, tolerance = 2) => {
+    if (!Number.isFinite(before) || !Number.isFinite(after)) return;
+    const delta = after - before;
+    if (Math.abs(delta) <= tolerance) return;
+    const rounded = Math.round(delta * 10) / 10;
+    changes.push(`${label}${rounded > 0 ? '+' : ''}${rounded}px`);
+  };
+  // 内容只会向下追加（懒加载/虚拟列表实测高度）时不影响已捕获帧坐标，只有变矮才报错。
+  const compareShrink = (label, before, after, tolerance) => {
+    if (!Number.isFinite(before) || !Number.isFinite(after)) return;
+    const delta = after - before;
+    if (delta >= -tolerance) return;
+    const rounded = Math.round(delta * 10) / 10;
+    changes.push(`${label}${rounded}px`);
+  };
+  if (current.surfaceToken !== prepared.surfaceToken) changes.push('滚动区域已切换');
+  compareShrink('可滚动高度', original?.maxScrollTop, next?.maxScrollTop, SURFACE_METRIC_TOLERANCE);
+  compareShrink('内容高度', original?.scrollHeight, next?.scrollHeight, SURFACE_METRIC_TOLERANCE);
+  compare('水平滚动', original?.scrollLeft, next?.scrollLeft, 0);
+  for (const [key, label] of [['left', '视口左'], ['top', '视口上'], ['width', '视口宽'], ['height', '视口高']]) {
+    compare(label, original?.viewport?.[key], next?.viewport?.[key]);
   }
+  // visible 是「容器 ∩ 窗口」，内部容器场景下窗口/容器一变它就变，必须一并比对。
+  for (const [key, label] of [['left', '可见区左'], ['top', '可见区上'], ['width', '可见区宽'], ['height', '可见区高']]) {
+    compare(label, original?.visible?.[key], next?.visible?.[key]);
+  }
+  if (changes.length) {
+    const error = codedError(ERROR_CODE.SURFACE_CHANGED, '截图区域在捕获过程中发生变化');
+    error.details = changes.join('，');
+    throw error;
+  }
+}
+
+/** 滚动表面顶部相对 window 顶部的偏移；两者相同时为 0。 */
+function visibleTopInset(metrics) {
+  const viewportTop = Number.isFinite(metrics?.viewport?.top) ? metrics.viewport.top : 0;
+  const visibleTop = Number.isFinite(metrics?.visible?.top) ? metrics.visible.top : viewportTop;
+  return visibleTop - viewportTop;
 }
 
 function defaultTimestamp(date = new Date()) {
@@ -223,8 +260,11 @@ export async function runCapture(request, deps) {
     const targets = buildScrollTargets({
       selectionTop: selection.top,
       selectionBottom: selection.bottom,
-      viewportHeight: metrics.viewport.height,
-      maxScrollTop: metrics.maxScrollTop
+      // 分帧步长是「窗口内可见的内容高度」，不是容器自身高度：
+      // 容器比窗口大时按容器高度推进会每帧漏一段，拼出来就是一条条空白。
+      viewportHeight: metrics.visible?.height ?? metrics.clientHeight,
+      maxScrollTop: metrics.maxScrollTop,
+      topInset: visibleTopInset(metrics)
     });
     let scaleX;
     let scaleY;
@@ -245,13 +285,25 @@ export async function runCapture(request, deps) {
       const top = targets[index];
       const scrolled = await tabMessage(makeMessage(MESSAGE.SCROLL_TO, taskId, {top}));
       assertSurfaceInvariant(prepared, scrolled);
-      await tabMessage(makeMessage(MESSAGE.SET_FIXED_VISIBILITY, taskId, {visible: index === 0}));
 
       checkCancellation();
       await ensureActive();
       stage = `capture#${index + 1}/${targets.length}`;
+      let captureMetrics = scrolled.metrics;
       const dataUrl = await awaitOperation(() =>
-        captureGate.run(() => {
+        captureGate.run(async () => {
+          // 先等配额，再隐藏浮层并立刻截图：页面可能在等待期间重新渲染，
+          // 过早隐藏会让顶部导航又恢复可见并被截进成品。
+          const frozen = await tabMessage(makeMessage(MESSAGE.SET_FIXED_VISIBILITY, taskId, {visible: index === 0}));
+          if (frozen.metrics) {
+            // 页面可能在 SCROLL_TO 返回后又自行滚动（虚拟列表吸底、懒加载校正等）。
+            // 以快门前的真实 scrollTop 裁剪，否则顶部会多出选区以上的内容。
+            captureMetrics = frozen.metrics;
+            assertSurfaceInvariant(prepared, {
+              metrics: frozen.metrics,
+              surfaceToken: frozen.surfaceToken ?? scrolled.surfaceToken
+            });
+          }
           inFlightCapture = Promise.resolve().then(() => captureVisible(windowId));
           return inFlightCapture;
         }, signal));
@@ -262,17 +314,19 @@ export async function runCapture(request, deps) {
           cssWidth: selection.width,
           cssHeight: selection.height,
           firstDataUrl: dataUrl,
-          innerWidth: metrics.viewport.width,
-          innerHeight: metrics.viewport.height
+          // 比例必须是 bitmap / 标签页视口宽高，不能用内部滚动容器的尺寸
+          innerWidth: metrics.window?.width ?? metrics.viewport.width,
+          innerHeight: metrics.window?.height ?? metrics.viewport.height
         }));
         ({scaleX, scaleY} = begun);
       }
 
       const placement = computeFramePlacement({
         selection,
-        scrollLeft: scrolled.metrics.scrollLeft,
-        scrollTop: scrolled.metrics.scrollTop,
-        viewport: scrolled.metrics.viewport,
+        scrollLeft: captureMetrics.scrollLeft,
+        scrollTop: captureMetrics.scrollTop,
+        viewport: captureMetrics.viewport,
+        visible: captureMetrics.visible,
         scaleX,
         scaleY
       });
@@ -292,6 +346,15 @@ export async function runCapture(request, deps) {
   } finally {
     clearTimeout(timer);
     externalSignal?.removeEventListener('abort', onExternalAbort);
+    const abortComposition = async () => {
+      const abort = Promise.resolve()
+        .then(() => sendOffscreen(makeMessage(MESSAGE.COMPOSER_ABORT, taskId)));
+      try {
+        await cleanupTimeout(abort, 'composerAbort');
+      } catch {
+        // 清理失败不能覆盖原始错误。
+      }
+    };
     if (captureError) {
       if (inFlightCapture) {
         try {
@@ -300,33 +363,35 @@ export async function runCapture(request, deps) {
           // A browser capture may outlive its documented settle bound; clean up anyway.
         }
       }
-      const abort = Promise.resolve()
-        .then(() => sendOffscreen(makeMessage(MESSAGE.COMPOSER_ABORT, taskId)));
-      try {
-        await cleanupTimeout(abort, 'composerAbort');
-      } catch {
-        // Preserve the original capture error while still attempting page restoration.
-      }
+      await abortComposition();
     }
     const restore = Promise.resolve()
       .then(() => sendTab(tabId, makeMessage(MESSAGE.RESTORE_PAGE, taskId, {
         expectError: Boolean(captureError)
       })));
+    let cleanupError = null;
     try {
       await cleanupTimeout(restore, 'restore');
     } catch (error) {
       if (!captureError) {
-        throw normalizeError(error);
+        cleanupError = normalizeError(error);
       }
     }
     if (restoreZoom) {
       try {
         await cleanupTimeout(restoreZoom(), 'zoomRestore');
       } catch (error) {
-        if (!captureError) {
-          throw normalizeError(error);
-        }
+        if (!captureError && !cleanupError) cleanupError = normalizeError(error);
       }
+    }
+    // 拼接已经成功、但页面恢复/缩放恢复失败时，离屏画布还没有被登记到
+    // compositions（服务端只会在 runCapture 正常返回后才登记）。这里不释放
+    // 会留下无人认领的会话，导致下一次截图永远收到 STALE_TASK。
+    if (!captureError && cleanupError) {
+      captureError = cleanupError;
+      await abortComposition();
+      // 此时 try 里已经 return 了；只有从 finally 抛出才能覆盖成功结果。
+      throw captureError;
     }
   }
   throw captureError;

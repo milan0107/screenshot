@@ -65,8 +65,9 @@ export function createCaptureFeedback(ownerDocument = document) {
   Object.assign(host.style, {
     position: 'fixed', top: '16px', left: '50%', transform: 'translateX(-50%)',
     zIndex: '2147483647', pointerEvents: 'none', visibility: 'hidden',
+    maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box',
     padding: '8px 12px', borderRadius: '8px', color: '#f8fafc',
-    background: 'rgba(15, 23, 42, .92)', font: '13px/1.2 system-ui, sans-serif'
+    background: 'rgba(15, 23, 42, .92)', font: '13px/1.4 system-ui, sans-serif'
   });
   ownerDocument.documentElement.append(host);
 
@@ -471,6 +472,14 @@ export function createSelectionController({
       end: null,
       lastClientPoint: null,
       pointer: null,
+      /** 框选起点（客户端坐标），用于判断固定栏是否真的在选区里。 */
+      startClientPoint: null,
+      /** 框选终点的客户端坐标，用于反向拖拽时取真正位于上方的那个端点。 */
+      endClientPoint: null,
+      /** 选区上边缘的客户端坐标（拖拽或调整后确定），固定栏首帧是否保留以它为准。 */
+      selectionTopClientPoint: null,
+      /** 最近一次纵向拖拽方向（-1 上 / 1 下 / 0 未移动），用于约束自动滚动方向。 */
+      verticalDirection: 0,
       selection: null,
       start: null,
       surface: null,
@@ -482,9 +491,17 @@ export function createSelectionController({
 
     function clientPoint(event) {
       const raw = {x: event.clientX, y: event.clientY};
-      return state.surface?.kind === 'element'
-        ? state.surface.clampClientPoint(raw.x, raw.y)
-        : raw;
+      // 页面表面同样要夹到窗口内：拖拽时指针可能移出浏览器窗口，
+      // 越界部分 captureVisibleTab 截不到，会在成品里留下白边。
+      return state.surface ? state.surface.clampClientPoint(raw.x, raw.y) : raw;
+    }
+
+    /** 内容坐标 → 客户端坐标。 */
+    function toClientPoint(content, metrics) {
+      return {
+        x: content.x - metrics.scrollLeft + metrics.viewport.left,
+        y: content.y - metrics.scrollTop + metrics.viewport.top
+      };
     }
 
     function render() {
@@ -492,11 +509,13 @@ export function createSelectionController({
       state.selection = normalizeRect(state.start, state.end);
       const metrics = state.surface.getMetrics();
       const {viewport} = metrics;
+      const topLeft = toClientPoint({x: state.selection.left, y: state.selection.top}, metrics);
+      const bottomRight = toClientPoint({x: state.selection.right, y: state.selection.bottom}, metrics);
       state.ui.showSelection({
-        left: state.selection.left - metrics.scrollLeft + viewport.left,
-        top: state.selection.top - metrics.scrollTop + viewport.top,
-        right: state.selection.right - metrics.scrollLeft + viewport.left,
-        bottom: state.selection.bottom - metrics.scrollTop + viewport.top
+        left: topLeft.x,
+        top: topLeft.y,
+        right: bottomRight.x,
+        bottom: bottomRight.y
       }, viewport);
     }
 
@@ -504,6 +523,7 @@ export function createSelectionController({
       if (!state.surface) return;
       state.lastClientPoint = {x: event.clientX, y: event.clientY};
       const point = clientPoint(event);
+      state.endClientPoint = point;
       state.end = state.surface.toContentPoint(point.x, point.y);
       render();
     }
@@ -526,6 +546,9 @@ export function createSelectionController({
       // 允许越过对侧边（自动归一化），但不能缩成 0 尺寸。
       if (next.right - next.left < 2 || next.bottom - next.top < 2) return;
       state.selection = next;
+      if ((CORNER_EDGES[state.adjustCorner] ?? []).includes('top')) {
+        state.selectionTopClientPoint = point;
+      }
       const start = {x: next.left, y: next.top};
       const end = {x: next.right, y: next.bottom};
       state.start = start;
@@ -539,14 +562,17 @@ export function createSelectionController({
         return;
       }
       const metrics = state.surface.getMetrics();
-      const point = state.surface.kind === 'element'
-        ? state.surface.clampClientPoint(state.lastClientPoint.x, state.lastClientPoint.y)
-        : state.lastClientPoint;
-      const speed = edgeScrollSpeed(point.y, metrics.viewport);
-      if (speed !== 0) {
+      const point = state.surface.clampClientPoint(state.lastClientPoint.x, state.lastClientPoint.y);
+      // 容器被窗口裁掉一部分时，真正能碰到的上下边缘是「容器 ∩ 窗口」，
+      // 用容器自身的 viewport 会让屏幕边缘那段触发区不可达。
+      const speed = edgeScrollSpeed(point.y, metrics.visible ?? metrics.viewport);
+      // 只在指针朝该方向拖动时自动滚动：否则从顶部附近开始向下框选时，
+      // 会立刻触发「向上滚动」，把起点以上的内容扩进选区。
+      if (speed !== 0 && Math.sign(speed) === state.verticalDirection) {
         const nextTop = Math.min(metrics.maxScrollTop, Math.max(0, metrics.scrollTop + speed));
         state.surface.setScrollTop(nextTop);
         state.end = state.surface.toContentPoint(point.x, point.y);
+        state.endClientPoint = point;
         render();
       }
       state.animationFrame = requestFrame(autoScroll);
@@ -556,11 +582,7 @@ export function createSelectionController({
     function menuAnchor() {
       if (state.pointer) return state.pointer;
       if (!state.selection || !state.surface) return null;
-      const metrics = state.surface.getMetrics();
-      return {
-        x: state.selection.right - metrics.scrollLeft + metrics.viewport.left,
-        y: state.selection.bottom - metrics.scrollTop + metrics.viewport.top
-      };
+      return toClientPoint({x: state.selection.right, y: state.selection.bottom}, state.surface.getMetrics());
     }
 
     function resetSelection() {
@@ -574,6 +596,8 @@ export function createSelectionController({
       state.end = null;
       state.selection = null;
       state.lastClientPoint = null;
+      state.endClientPoint = null;
+      state.selectionTopClientPoint = null;
       state.ui?.reset();
       state.ui?.setMode(state.highQuality);
     }
@@ -589,7 +613,8 @@ export function createSelectionController({
       state.busy = true;
       state.zoomManaged = state.highQuality === true;
       state.ui?.setVisible(false);
-      onCaptureRequested?.({taskId: state.taskId, selection, surface});
+      onCaptureRequested?.({taskId: state.taskId, selection, surface,
+        startClientPoint: state.selectionTopClientPoint ?? state.startClientPoint});
       let request;
       try {
         request = sendMessage(makeMessage(MESSAGE.CAPTURE_REQUEST, state.taskId, {
@@ -682,9 +707,12 @@ export function createSelectionController({
         state.surface = createSurface(findScrollSurface(target));
         state.surface.lock();
         state.dragging = true;
+        state.verticalDirection = 0;
         state.lastClientPoint = {x: event.clientX, y: event.clientY};
         const point = clientPoint(event);
         state.start = state.surface.toContentPoint(point.x, point.y);
+        state.startClientPoint = point;
+        state.endClientPoint = {...point};
         state.end = {...state.start};
         render();
         state.animationFrame = requestFrame(autoScroll);
@@ -693,6 +721,10 @@ export function createSelectionController({
       onPointerMove(event) {
         state.pointer = {x: event.clientX, y: event.clientY};
         if (state.dragging) {
+          const previous = state.lastClientPoint;
+          if (previous && event.clientY !== previous.y) {
+            state.verticalDirection = Math.sign(event.clientY - previous.y);
+          }
           updateEndpoint(event);
           return;
         }
@@ -718,6 +750,9 @@ export function createSelectionController({
           return;
         }
         // 框选完成：显示手柄与「确认截图 / 取消」，等用户确认后才截图。
+        state.selectionTopClientPoint = state.start.y <= state.end.y
+          ? state.startClientPoint
+          : state.endClientPoint;
         state.ui?.setAdjustable(true);
         state.ui?.showConfirm(menuAnchor());
       },
@@ -759,9 +794,12 @@ export function createSelectionController({
             // 布局已随缩放变化，旧选区（若有）坐标失效。
             resetSelection();
           } else {
-            await sendMessage(makeMessage(MESSAGE.DISABLE_HIGH_QUALITY, null, {
+            const response = await sendMessage(makeMessage(MESSAGE.DISABLE_HIGH_QUALITY, null, {
               restoreZoomTo: state.restoreZoomTo
             }));
+            // 恢复失败时页面仍停在 150% 缩放，不能把状态改成「普通」：
+            // 否则后续截图不会带 restoreZoomTo，页面会一直保持放大。
+            if (response?.ok !== true) return;
             state.highQuality = false;
             state.restoreZoomTo = null;
             resetSelection();

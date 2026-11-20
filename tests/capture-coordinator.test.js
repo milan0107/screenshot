@@ -228,7 +228,9 @@ test('coordinator 中旧 task 最后一帧与新 task 第一帧的 API 调用相
   const selection = {left: 0, top: 100, right: 100, bottom: 200, width: 100, height: 100};
   const baseMetrics = {
     scrollLeft: 0, scrollTop: 0, maxScrollTop: 500,
-    viewport: {left: 0, top: 0, width: 800, height: 600}
+    clientWidth: 800, clientHeight: 600,
+    viewport: {left: 0, top: 0, width: 800, height: 600},
+    window: {width: 800, height: 600}
   };
   const createDeps = request => ({
     captureGate: gate,

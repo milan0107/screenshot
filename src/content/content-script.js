@@ -74,7 +74,8 @@
     // 模块尚未加载完成时放行（此时不可能有离屏拼接消息），加载后按白名单过滤。
     if (tabMessageTypes && !tabMessageTypes.has(message.type)) return false;
     ready.then(() => captureHandler.handle(message)).then(sendResponse,
-      error => sendResponse({ok: false, code: error?.code ?? 'CAPTURE_FAILED', message: error?.message ?? '截图失败，请重试'}));
+      error => sendResponse({ok: false, code: error?.code ?? 'CAPTURE_FAILED',
+        message: error?.message ?? '截图失败，请重试', ...(error?.details ? {details: error.details} : {})}));
     return true;
   });
   addEventListener('keydown', event => controller?.handleKeyDown(event), true);

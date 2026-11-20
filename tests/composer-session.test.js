@@ -258,6 +258,25 @@ test('message handler maps finish and release and permits a later task', async (
   }), { ok: true, scaleX: 2, scaleY: 2, width: 800, height: 1600 });
 });
 
+test('新任务 BEGIN 会丢弃无人认领的旧会话，Service Worker 重启后仍能继续截图', async () => {
+  const harness = createHarness();
+  const session = new ComposerSession(harness.dependencies);
+  const handleMessage = createComposerMessageHandler(session);
+  const beginPayload = { cssWidth: 400, cssHeight: 800, firstDataUrl: 'data:first', innerWidth: 600, innerHeight: 400 };
+
+  await handleMessage({ source: 'longshot', type: MESSAGE.COMPOSER_BEGIN, taskId: 'orphan', payload: beginPayload });
+  // 模拟 Service Worker 重启：compositions 内存表丢失，没有人再来 RELEASE/ABORT
+  assert.deepEqual(await handleMessage({
+    source: 'longshot', type: MESSAGE.COMPOSER_BEGIN, taskId: 'fresh', payload: beginPayload
+  }), { ok: true, scaleX: 2, scaleY: 2, width: 800, height: 1600 });
+
+  assert.deepEqual(await handleMessage({
+    source: 'longshot', type: MESSAGE.COMPOSER_ADD, taskId: 'fresh',
+    payload: { dataUrl: 'data:next', placement: { sx: 0, sy: 0, sw: 10, sh: 10, dx: 0, dy: 0, dw: 10, dh: 10 } }
+  }), { ok: true });
+  assert.equal(session.state, 'begun');
+});
+
 test('message handler serializes composer errors and abort is idempotent', async () => {
   const harness = createHarness();
   const session = new ComposerSession(harness.dependencies);

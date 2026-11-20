@@ -7,6 +7,13 @@ test('covers selection with a partial final segment', () => {
     viewportHeight: 300, maxScrollTop: 1200}), [100, 400, 550]);
 });
 
+test('subtracts the clipped top offset before generating scroll targets', () => {
+  assert.deepEqual(buildScrollTargets({
+    selectionTop: 300, selectionBottom: 1300, viewportHeight: 500,
+    maxScrollTop: 2000, topInset: 100
+  }), [200, 700]);
+});
+
 test('clamps targets near the end and removes duplicates', () => {
   assert.deepEqual(buildScrollTargets({selectionTop: 900, selectionBottom: 1300,
     viewportHeight: 300, maxScrollTop: 1000}), [900, 1000]);

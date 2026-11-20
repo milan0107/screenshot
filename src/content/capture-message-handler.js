@@ -6,6 +6,12 @@ const SETTLE_IMAGE_WAIT_MS = 300;
 const COMPOSER_TYPES = new Set(['COMPOSER_BEGIN', 'COMPOSER_ADD', 'COMPOSER_FINISH',
   'COMPOSER_EXPORT', 'COMPOSER_RELEASE', 'COMPOSER_ABORT']);
 
+function visibleTopInset(metrics) {
+  const viewportTop = Number.isFinite(metrics?.viewport?.top) ? metrics.viewport.top : 0;
+  const visibleTop = Number.isFinite(metrics?.visible?.top) ? metrics.visible.top : viewportTop;
+  return visibleTop - viewportTop;
+}
+
 export async function waitForScrollSettle({
   document: ownerDocument = document,
   requestAnimationFrame: requestFrame = globalThis.requestAnimationFrame?.bind(globalThis),
@@ -17,6 +23,9 @@ export async function waitForScrollSettle({
   const nextFrame = () => requestFrame
     ? new Promise(resolve => requestFrame(resolve))
     : Promise.resolve();
+  // 两帧：第一帧让页面处理 scroll 事件并挂载虚拟列表/懒加载节点，
+  // 第二帧确保这些节点已经进入合成帧，captureVisibleTab 才不会截到空白。
+  await nextFrame();
   await nextFrame();
   if (!waitImages) return;
   const images = [...(ownerDocument.querySelectorAll?.('img') ?? [])]
@@ -111,7 +120,8 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
         if (!message.taskId || activeFor(message.taskId) || message.taskId === pendingErrorTaskId) {
           const feedback = capture?.feedback ?? (passiveFeedback ??= createCaptureFeedback(ownerDocument));
           clearNotice();
-          feedback.showError(errorMessages[message.payload?.code] ?? message.payload?.message ?? '截图失败，请重试');
+          // 优先用后台下发的完整文案：SURFACE_CHANGED 会在括号里带上具体变化的指标。
+          feedback.showError(message.payload?.message ?? errorMessages[message.payload?.code] ?? '截图失败，请重试');
           if (message.taskId === pendingErrorTaskId) pendingErrorTaskId = null;
         }
         return {ok: true};
@@ -141,26 +151,45 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
       if (!activeFor(message.taskId)) return stale();
       if (message.type === MESSAGE.PREPARE_CAPTURE) {
         if (!capture.guard) {
-          capture.guard = new PageStateGuard({surface: capture.surface, document: ownerDocument});
+          capture.guard = new PageStateGuard({
+            surface: capture.surface,
+            document: ownerDocument,
+            selectionStart: capture.startClientPoint
+          });
           const metrics = capture.guard.prepare();
           capture.total = buildScrollTargets({selectionTop: capture.selection.top, selectionBottom: capture.selection.bottom,
-            viewportHeight: metrics.viewport.height, maxScrollTop: metrics.maxScrollTop}).length;
+            viewportHeight: metrics.visible?.height ?? metrics.clientHeight, maxScrollTop: metrics.maxScrollTop,
+            topInset: visibleTopInset(metrics)}).length;
         }
         return {ok: true, selection: capture.selection, metrics: capture.guard.assertStable(), surfaceToken: capture.surfaceToken};
       }
       if (message.type === MESSAGE.SET_FIXED_VISIBILITY) {
         capture.guard.setRepeatedElementsVisible(message.payload?.visible === true);
         capture.feedback.hideForCapture();
-        return {ok: true};
+        await settleAfterScroll({waitImages: false});
+        // 等页面渲染完再扫描一次：浮层可能在滚动后才挂载，或者被 React
+        // 重新渲染后恢复可见。必须在真正截图前重新应用隐藏状态。
+        if (typeof capture.guard.refreshRepeatedElements === 'function') {
+          capture.guard.refreshRepeatedElements();
+          capture.guard.setRepeatedElementsVisible(message.payload?.visible === true);
+        }
+        // 返回快门前的实际指标：页面可能在 SCROLL_TO 之后又自行滚动了
+        // 几像素，拼接必须按真正截图时的 scrollTop 裁剪，不能沿用旧值。
+        return {ok: true, metrics: capture.guard.assertStable(), surfaceToken: capture.surfaceToken};
       }
       if (message.type === MESSAGE.SCROLL_TO) {
         capture.guard.assertStable();
         capture.frame += 1;
-        capture.surface.setScrollTop(message.payload?.top);
+        const requested = message.payload?.top;
+        capture.surface.setScrollTop(requested);
         // 首屏等图片，后续屏只等两帧（懒加载图片在长图里本就随滚动才触发，逐屏等待收益低）。
         await settleAfterScroll({waitImages: capture.frame === 1});
         capture.guard.refreshRepeatedElements?.();
         const metrics = capture.guard.assertStable();
+        // 滚动没到位（内容未加载/被锚定/夹紧）会直接截出空白带，这里留下可排查的痕迹。
+        if (Number.isFinite(requested) && Math.abs(metrics.scrollTop - requested) > 1) {
+          console.warn('[longshot] 滚动位置与目标不一致', {requested, actual: metrics.scrollTop, frame: capture.frame});
+        }
         return {ok: true, metrics, surfaceToken: capture.surfaceToken};
       }
       return {ok: false, code: 'CAPTURE_FAILED', message: '未知截图请求'};

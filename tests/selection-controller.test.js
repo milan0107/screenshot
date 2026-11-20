@@ -75,7 +75,7 @@ function createHarness({sendMessage: suppliedSendMessage} = {}) {
       frames.delete(id);
       log.push(`cancel-frame:${id}`);
     },
-    onCaptureRequested: state => log.push(`capture-requested:${state.taskId}`),
+    onCaptureRequested: state => log.push(`capture-requested:${state.taskId}:${state.startClientPoint?.x},${state.startClientPoint?.y}`),
     onCopied: () => log.push('copied'),
     onActionFailed: message => log.push(`action-failed:${message}`)
   });
@@ -130,6 +130,17 @@ test('点「确认截图」才开始截图并隐藏扩展 UI', async () => {
   }));
   assert.ok(log.includes('visible:false'));
   assert.equal(log.some(entry => entry.startsWith('actions:')), false);
+});
+
+test('向上框选时固定栏锚点取选区上边缘，而不是按下的下边缘', () => {
+  const {controller, log, uis} = createHarness();
+  controller.enterSelection();
+  // 从下往上拖：选区上边缘在终点 (10, 30)，按下点 (40, 150) 是下边缘。
+  uis[0].callbacks.onPointerDown(pointer(40, 150));
+  uis[0].callbacks.onPointerMove(pointer(10, 30));
+  uis[0].callbacks.onPointerUp(pointer(10, 30));
+  uis[0].callbacks.onConfirm();
+  assert.ok(log.includes('capture-requested:task-1:10,30'));
 });
 
 test('点「取消」清掉选区并回到画质菜单', () => {
@@ -281,6 +292,28 @@ test('切回普通画质会请求恢复缩放，后续截图不带高清参数',
   assert.equal('restoreZoomTo' in request.payload, false);
 });
 
+test('恢复缩放失败时保持高清状态，避免页面停在高缩放却按普通模式截图', async () => {
+  const {controller, messages, log, uis} = createHarness({
+    sendMessage: message => {
+      if (message.type === MESSAGE.ENABLE_HIGH_QUALITY) return Promise.resolve({ok: true, originalZoom: 1.25});
+      if (message.type === MESSAGE.DISABLE_HIGH_QUALITY) {
+        return Promise.resolve({ok: false, code: 'CAPTURE_FAILED', message: '缩放恢复失败'});
+      }
+      return Promise.resolve({ok: true});
+    }
+  });
+  controller.enterSelection();
+  await uis[0].callbacks.onSelectMode('highQuality');
+  await uis[0].callbacks.onSelectMode('normal');
+
+  // 页面仍在 150%：状态必须保持高清，后续截图才会继续携带 restoreZoomTo
+  assert.ok(log.includes('mode:true'));
+  selectAndConfirm(uis[0]);
+  const request = messages.find(message => message.type === MESSAGE.CAPTURE_REQUEST);
+  assert.equal(request.payload.highQuality, true);
+  assert.equal(request.payload.restoreZoomTo, 1.25);
+});
+
 test('已开启高清但未截图就取消时恢复原缩放', async () => {
   const {controller, messages, uis} = createHarness({
     sendMessage: message => Promise.resolve(
@@ -417,7 +450,8 @@ test('选区为空且无指针时锚点为 null，UI 用默认位置（不抛错
 test('controller auto-scrolls at 28 pixels per frame at the surface edge', () => {
   const {controller, frames, log, uis} = createHarness();
   controller.enterSelection();
-  uis[0].callbacks.onPointerDown(pointer(20, 200));
+  uis[0].callbacks.onPointerDown(pointer(20, 100));
+  uis[0].callbacks.onPointerMove(pointer(20, 200));
   const firstFrame = frames.entries().next().value;
   frames.delete(firstFrame[0]);
   firstFrame[1]();
@@ -426,6 +460,41 @@ test('controller auto-scrolls at 28 pixels per frame at the surface edge', () =>
   assert.equal(frames.size, 1);
   uis[0].callbacks.onPointerUp(pointer(20, 200));
   assert.equal(frames.size, 0);
+});
+
+test('从上边缘附近开始向下框选时不会反向向上自动滚动', () => {
+  const {controller, frames, log, uis} = createHarness();
+  controller.enterSelection();
+  uis[0].callbacks.onPointerDown(pointer(20, 20));
+
+  // 尚未移动：不得滚动
+  const first = frames.entries().next().value;
+  frames.delete(first[0]);
+  first[1]();
+  assert.equal(log.some(entry => entry.startsWith('scroll:')), false);
+
+  // 指针向下移动但仍位于上边缘触发区：方向不符，不得向上滚
+  uis[0].callbacks.onPointerMove(pointer(20, 60));
+  const second = frames.entries().next().value;
+  frames.delete(second[0]);
+  second[1]();
+  assert.equal(log.some(entry => entry.startsWith('scroll:')), false);
+
+  uis[0].callbacks.onPointerUp(pointer(20, 60));
+});
+
+test('向上拖到上边缘时才向上自动滚动', () => {
+  const {controller, frames, log, uis} = createHarness();
+  controller.enterSelection();
+  uis[0].callbacks.onPointerDown(pointer(20, 120));
+  uis[0].callbacks.onPointerMove(pointer(20, 10));
+  const frame = frames.entries().next().value;
+  frames.delete(frame[0]);
+  frame[1]();
+
+  // 已在顶部，nextTop 被夹到 0；能出现这条记录即说明走了向上滚动分支
+  assert.ok(log.includes('scroll:0'));
+  uis[0].callbacks.onPointerUp(pointer(20, 10));
 });
 
 test('进入选区模式只弹画质菜单，不弹完成后的操作菜单', () => {

@@ -29,6 +29,8 @@ export class ComposerSession {
     try {
       bitmap = await this.decodeImage(firstDataUrl);
       this.#requireGeneration(generation);
+      // innerWidth/innerHeight 必须是**标签页视口**尺寸（captureVisibleTab 的截图范围），
+      // 不是内部滚动容器的尺寸；cssWidth/cssHeight 则是选区的视觉尺寸。
       const scaleX = bitmap.width / innerWidth;
       const scaleY = bitmap.height / innerHeight;
       const width = Math.round(cssWidth * scaleX);
@@ -233,7 +235,22 @@ export function createComposerMessageHandler(session) {
       }
     }
 
-    if (currentTaskId !== null && taskId !== currentTaskId) return staleResponse();
+    if (currentTaskId !== null && taskId !== currentTaskId) {
+      // 旧任务的结果可能因 Service Worker 被回收而失去登记，没人会再来
+      // RELEASE/ABORT。此时若一直回 stale，新的 BEGIN 永远无法开始，
+      // 扩展会卡死到重载为止。无人推进的旧会话直接丢弃（与「新任务开始时
+      // 自动丢弃旧结果」的策略一致）；仍在编码/绘制中的旧会话则继续保护。
+      const abandoned = ['begun', 'finished', 'failed'].includes(session.state);
+      if (type !== MESSAGE.COMPOSER_BEGIN || !abandoned) return staleResponse();
+      lastTerminatedTaskId = currentTaskId;
+      currentTaskId = null;
+      ++taskGeneration;
+      try {
+        session.abort();
+      } catch {
+        // 丢弃失败也要继续开始新任务，否则后续截图全部不可用。
+      }
+    }
     if (currentTaskId === null && type !== MESSAGE.COMPOSER_BEGIN) return staleResponse();
     if (currentTaskId === null) {
       currentTaskId = taskId;

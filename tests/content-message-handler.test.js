@@ -24,7 +24,8 @@ test('生产消息处理器确认 active/stale restore，拒绝 stale 改动并�
   await handler.handle({type: MESSAGE.PREPARE_CAPTURE, taskId: 'active'});
   await handler.handle({type: MESSAGE.SET_FIXED_VISIBILITY, taskId: 'active', payload: {visible: false}});
   await handler.handle({type: MESSAGE.SCROLL_TO, taskId: 'active', payload: {top: 50}});
-  assert.deepEqual(events.slice(-5), ['fixed:false', 'hide', 'stable', 'scroll:50', 'stable']);
+  assert.deepEqual(events.slice(-6),
+    ['fixed:false', 'hide', 'stable', 'stable', 'scroll:50', 'stable']);
   assert.equal((await handler.handle({type: MESSAGE.RESTORE_PAGE, taskId: 'active'})).ok, true);
   assert.ok(events.includes('restore'));
 });
@@ -201,6 +202,62 @@ test('离屏拼接消息（COMPOSER_*）不被页面应答，避免抢答导致�
   assert.equal((await prepared.handle({type: MESSAGE.SCROLL_TO, taskId: 'task2', payload: {top: 0}})).ok, true);
 });
 
+test('SET_FIXED_VISIBILITY waits for the visibility change to be painted', async () => {
+  const events = [];
+  class Guard {
+    prepare() { return {scrollTop: 0, maxScrollTop: 100, viewport: {height: 50}}; }
+    assertStable() { return {scrollTop: 0, maxScrollTop: 100, viewport: {height: 50}}; }
+    setRepeatedElementsVisible(visible) { events.push(`fixed:${visible}`); }
+  }
+  const handler = createCaptureMessageHandler({
+    MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0],
+    createCaptureFeedback: () => ({hideForCapture: () => events.push('hide'), remove() {}}),
+    controller: {enterSelection() {}}, document: {},
+    settleAfterScroll: ({waitImages}) => {
+      events.push(`settle:${waitImages}`);
+      return Promise.resolve();
+    }
+  });
+  handler.onCaptureRequested({taskId: 'task', selection: {top: 0, bottom: 50},
+    surface: {setScrollTop() {}}, surfaceToken: 't'});
+  await handler.handle({type: MESSAGE.PREPARE_CAPTURE, taskId: 'task'});
+  events.length = 0;
+
+  const response = await handler.handle({type: MESSAGE.SET_FIXED_VISIBILITY, taskId: 'task', payload: {visible: false}});
+
+  assert.deepEqual(events, ['fixed:false', 'hide', 'settle:false']);
+  // 快门前的实际指标要带回后台，拼接按它裁剪。
+  assert.deepEqual(response.metrics, {scrollTop: 0, maxScrollTop: 100, viewport: {height: 50}});
+  assert.equal(response.surfaceToken, 't');
+});
+
+test('SET_FIXED_VISIBILITY 在绘制后重新扫描并再次隐藏动态浮层', async () => {
+  const events = [];
+  class Guard {
+    prepare() { return {scrollTop: 0, maxScrollTop: 100, viewport: {height: 50}}; }
+    assertStable() { return {scrollTop: 0, maxScrollTop: 100, viewport: {height: 50}}; }
+    setRepeatedElementsVisible(visible) { events.push(`fixed:${visible}`); }
+    refreshRepeatedElements() { events.push('refresh'); }
+  }
+  const handler = createCaptureMessageHandler({
+    MESSAGE, PageStateGuard: Guard, buildScrollTargets: () => [0],
+    createCaptureFeedback: () => ({hideForCapture: () => events.push('hide'), remove() {}}),
+    controller: {enterSelection() {}}, document: {},
+    settleAfterScroll: ({waitImages}) => {
+      events.push(`settle:${waitImages}`);
+      return Promise.resolve();
+    }
+  });
+  handler.onCaptureRequested({taskId: 'task', selection: {top: 0, bottom: 50},
+    surface: {setScrollTop() {}}, surfaceToken: 't'});
+  await handler.handle({type: MESSAGE.PREPARE_CAPTURE, taskId: 'task'});
+  events.length = 0;
+
+  await handler.handle({type: MESSAGE.SET_FIXED_VISIBILITY, taskId: 'task', payload: {visible: false}});
+
+  assert.deepEqual(events, ['fixed:false', 'hide', 'settle:false', 'refresh', 'fixed:false']);
+});
+
 test('SCROLL_TO 在返回指标前依次等待两帧和有界布局稳定', async () => {
   const events = [];
   class Guard {
@@ -222,7 +279,7 @@ test('SCROLL_TO 在返回指标前依次等待两帧和有界布局稳定', asyn
   assert.deepEqual(events, ['metrics', 'scroll:25', 'settled', 'sticky', 'metrics']);
 });
 
-test('默认滚动稳定器先等一帧，再以 300ms 上限等待未完成图片', async () => {
+test('默认滚动稳定器先等两帧，再以 300ms 上限等待未完成图片', async () => {
   const events = [];
   const image = {complete: false, addEventListener() {}};
   await waitForScrollSettle({
@@ -231,10 +288,10 @@ test('默认滚动稳定器先等一帧，再以 300ms 上限等待未完成图�
     setTimeout: (callback, delay) => { events.push(`timer:${delay}`); callback(); return 1; },
     clearTimeout: () => events.push('clear')
   });
-  assert.deepEqual(events, ['frame', 'timer:300']);
+  assert.deepEqual(events, ['frame', 'frame', 'timer:300']);
 });
 
-test('waitImages=false 时跳过图片等待，只等一帧（后续屏提速）', async () => {
+test('waitImages=false 时跳过图片等待，只等两帧（后续屏提速）', async () => {
   const events = [];
   let queried = 0;
   await waitForScrollSettle({
@@ -242,7 +299,7 @@ test('waitImages=false 时跳过图片等待，只等一帧（后续屏提速）
     requestAnimationFrame: callback => { events.push('frame'); callback(); },
     waitImages: false
   });
-  assert.deepEqual(events, ['frame']);
+  assert.deepEqual(events, ['frame', 'frame']);
   assert.equal(queried, 0, '跳过图片等待时不应扫描 DOM');
 });
 
@@ -301,7 +358,7 @@ test('已确认捕获时再次进入选择态会等 RESTORE_PAGE 后再恢复并
 
 test('真实截图调用前 SCROLL_TO 与 SET_FIXED_VISIBILITY 会保持反馈隐藏', async () => {
   const events = [];
-  const metrics = {scrollLeft: 0, scrollTop: 0, maxScrollTop: 0,
+  const metrics = {scrollLeft: 0, scrollTop: 0, maxScrollTop: 0, clientHeight: 50,
     viewport: {left: 0, top: 0, width: 50, height: 50}};
   let feedbackVisible = false;
   class Guard {

@@ -13,7 +13,9 @@ import {ERROR_CODE, MESSAGE} from '../src/shared/protocol.js';
 const selection = {left: 10, top: 100, right: 210, bottom: 1700, width: 200, height: 1600};
 const metrics = {
   scrollLeft: 0, scrollTop: 0, maxScrollTop: 1100,
-  viewport: {left: 0, top: 0, width: 800, height: 600}
+  clientWidth: 800, clientHeight: 600,
+  viewport: {left: 0, top: 0, width: 800, height: 600},
+  window: {width: 800, height: 600}
 };
 
 function deferred() {
@@ -122,6 +124,31 @@ test('首帧按 begin 再 add 编排，拼接完成后不下载也不释放画�
   });
 });
 
+test('按快门前的实际 scrollTop 裁剪，页面自行滚动不会多截选区上方内容', async () => {
+  const harness = makeHarness();
+  const baseSendTab = harness.deps.sendTab;
+  let drifted = false;
+  harness.deps.sendTab = async (tabId, message) => {
+    const response = await baseSendTab(tabId, message);
+    if (message.type === MESSAGE.SET_FIXED_VISIBILITY && !drifted) {
+      // SCROLL_TO 目标是 100，但页面在快门响应前又自行滚动到了 40。
+      drifted = true;
+      return {...response, metrics: {...metrics, scrollTop: 40}, surfaceToken: 'surface-1'};
+    }
+    return response;
+  };
+
+  await runCapture({taskId: 'task-drift', tabId: 7, windowId: 3}, harness.deps);
+
+  const firstAdd = harness.messages.find(message => message.type === MESSAGE.COMPOSER_ADD);
+  // 实际可见内容从 40 开始，选区从 100 开始：源图必须裁掉上方 60 CSS px，
+  // 而不是误用 SCROLL_TO 返回的 100 让顶部多截一截。
+  assert.deepEqual(firstAdd.payload.placement, {
+    sx: 20, sy: 120, sw: 400, sh: 1080,
+    dx: 0, dy: 0, dw: 400, dh: 1080
+  });
+});
+
 test('多帧 COMPOSER_ADD 严格串行发送，不会并发进入拼接状态机', async () => {
   const harness = makeHarness();
   const inFlight = [];
@@ -210,6 +237,118 @@ test('丢弃拼接结果时离屏文档不可用也不会抛错', async () => {
   deps.sendOffscreen = async () => { throw new Error('No offscreen document'); };
 
   await assert.doesNotReject(discardComposition({taskId: 'task-discard'}, deps));
+});
+
+test('内部滚动容器按窗口视口换算裁剪比例，而不是容器自身尺寸', async () => {
+  const harness = makeHarness();
+  const elementMetrics = {
+    scrollLeft: 0, scrollTop: 40, maxScrollTop: 400,
+    clientWidth: 400, clientHeight: 300, scrollHeight: 700,
+    viewport: {left: 300, top: 200, width: 400, height: 300},
+    window: {width: 1200, height: 800}
+  };
+  const elementSelection = {left: 0, top: 40, right: 400, bottom: 340, width: 400, height: 300};
+  harness.deps.sendTab = async (_tabId, message) => {
+    if (message.type === MESSAGE.PREPARE_CAPTURE) {
+      return {ok: true, selection: elementSelection, metrics: elementMetrics, surfaceToken: 'surface-element'};
+    }
+    if (message.type === MESSAGE.SCROLL_TO) {
+      return {ok: true, metrics: {...elementMetrics, scrollTop: message.payload.top}, surfaceToken: 'surface-element'};
+    }
+    return {ok: true};
+  };
+  harness.deps.captureVisible = async () => 'data:frame';
+
+  await runCapture({taskId: 'task-element', tabId: 7, windowId: 3}, harness.deps);
+
+  const begin = harness.messages.find(message => message.type === MESSAGE.COMPOSER_BEGIN);
+  // 截图比例必须是 bitmap / window.innerWidth，传容器尺寸会把整张图放大并错位
+  assert.deepEqual(begin.payload, {
+    cssWidth: 400, cssHeight: 300, firstDataUrl: 'data:frame', innerWidth: 1200, innerHeight: 800
+  });
+  const add = harness.messages.find(message => message.type === MESSAGE.COMPOSER_ADD);
+  assert.deepEqual(add.payload.placement, {sx: 600, sy: 400, sw: 800, sh: 600, dx: 0, dy: 0, dw: 800, dh: 600});
+});
+
+test('分帧步长按窗口内实际可见高度计算，容器被窗口裁掉的部分不会造成空洞', async () => {
+  const harness = makeHarness();
+  const base = {
+    scrollLeft: 0, scrollTop: 100, maxScrollTop: 1100, scrollHeight: 1700,
+    clientWidth: 800, clientHeight: 600,
+    viewport: {left: 0, top: 56, width: 800, height: 600},
+    visible: {left: 0, top: 56, width: 800, height: 300},
+    window: {width: 1200, height: 356}
+  };
+  harness.deps.sendTab = async (_tabId, message) => {
+    harness.messages.push(message);
+    if (message.type === MESSAGE.PREPARE_CAPTURE) {
+      return {ok: true, selection, metrics: base, surfaceToken: 'surface-clipped'};
+    }
+    if (message.type === MESSAGE.SCROLL_TO) {
+      return {ok: true, metrics: {...base, scrollTop: message.payload.top}, surfaceToken: 'surface-clipped'};
+    }
+    return {ok: true};
+  };
+
+  await runCapture({taskId: 'task-clipped', tabId: 7, windowId: 3}, harness.deps);
+
+  const scrolls = harness.messages.filter(message => message.type === MESSAGE.SCROLL_TO);
+  // 可见高度 300（不是 clientHeight 600）→ 100,400,700,1000,1100 共 5 帧
+  assert.deepEqual(scrolls.map(message => message.payload.top), [100, 400, 700, 1000, 1100]);
+});
+
+test('内部容器顶部被窗口裁掉时首帧目标扣掉可见区偏移', async () => {
+  const harness = makeHarness();
+  const clippedSelection = {left: 0, top: 300, right: 400, bottom: 1300, width: 400, height: 1000};
+  const base = {
+    scrollLeft: 0, scrollTop: 120, maxScrollTop: 2000, scrollHeight: 3000,
+    clientWidth: 400, clientHeight: 600,
+    viewport: {left: 0, top: -100, width: 400, height: 600},
+    visible: {left: 0, top: 0, width: 400, height: 500},
+    window: {width: 400, height: 500}
+  };
+  harness.deps.sendTab = async (_tabId, message) => {
+    harness.messages.push(message);
+    if (message.type === MESSAGE.PREPARE_CAPTURE) {
+      return {ok: true, selection: clippedSelection, metrics: base, surfaceToken: 'surface-offset'};
+    }
+    if (message.type === MESSAGE.SCROLL_TO) {
+      return {ok: true, metrics: {...base, scrollTop: message.payload.top}, surfaceToken: 'surface-offset'};
+    }
+    return {ok: true};
+  };
+
+  await runCapture({taskId: 'task-offset', tabId: 7, windowId: 3}, harness.deps);
+
+  const scrolls = harness.messages.filter(message => message.type === MESSAGE.SCROLL_TO);
+  // 窗口顶部对应内容坐标 scrollTop+100：目标 200 时才正好从选区 top=300 开始截。
+  assert.deepEqual(scrolls.map(message => message.payload.top), [200, 700]);
+  const firstAdd = harness.messages.find(message => message.type === MESSAGE.COMPOSER_ADD);
+  assert.equal(firstAdd.payload.placement.sy, 0);
+  assert.equal(firstAdd.payload.placement.dy, 0);
+});
+
+test('捕获期间容器与窗口的可见交集变化时判为表面变化', async () => {
+  const harness = makeHarness();
+  const base = {...metrics, visible: {left: 0, top: 0, width: 800, height: 600}};
+  harness.deps.sendTab = async (_tabId, message) => {
+    if (message.type === MESSAGE.PREPARE_CAPTURE) {
+      return {ok: true, selection, metrics: base, surfaceToken: 'surface-move'};
+    }
+    if (message.type === MESSAGE.SCROLL_TO) {
+      return {
+        ok: true,
+        metrics: {...base, scrollTop: message.payload.top, visible: {left: 0, top: 0, width: 800, height: 500}},
+        surfaceToken: 'surface-move'
+      };
+    }
+    return {ok: true};
+  };
+
+  await assert.rejects(
+    runCapture({taskId: 'task-move', tabId: 7, windowId: 3}, harness.deps),
+    error => error.code === ERROR_CODE.SURFACE_CHANGED && error.details?.includes('可见区高-100px')
+  );
 });
 
 test('高清模式在截图前提高 tab zoom，并在结束后恢复原 zoom', async () => {
@@ -321,6 +460,40 @@ test('用户取消另存为不算失败，仍释放画布', async () => {
     saveComposition({taskId: 'task-save-cancel', format: 'png'}, harness.deps)
   );
   assert.deepEqual(harness.events, ['composerFinish', 'download', 'composerRelease']);
+});
+
+test('不同写法的用户取消下载都按取消处理，不误报保存失败', async () => {
+  let message = '';
+  const harness = makeHarness({
+    download: async () => {
+      throw new Error(message);
+    }
+  });
+
+  for (const text of ['User canceled', 'User cancelled', 'Download canceled by the user']) {
+    message = text;
+    await assert.doesNotReject(
+      saveComposition({taskId: `task-cancel-${text}`, format: 'png'}, harness.deps),
+      text
+    );
+  }
+});
+
+test('拼接成功但页面恢复失败时释放离屏画布，避免后续截图永久卡死', async () => {
+  const harness = makeHarness();
+  const baseSendTab = harness.deps.sendTab;
+  harness.deps.sendTab = async (tabId, message) => {
+    const response = await baseSendTab(tabId, message);
+    if (message.type === MESSAGE.RESTORE_PAGE) throw new Error('restore exploded');
+    return response;
+  };
+
+  await assert.rejects(
+    runCapture({taskId: 'task-restore-fail', tabId: 7, windowId: 3}, harness.deps),
+    error => error.code === ERROR_CODE.CAPTURE_FAILED && error.message === 'restore exploded'
+  );
+  // 此时画布还没登记到 compositions；不 abort 会留下无人认领的会话。
+  assert.ok(harness.events.includes('composerAbort'));
 });
 
 test('默认截图间隔满足 Chrome 的 captureVisibleTab 频率配额（每秒最多 2 次）', () => {
@@ -866,6 +1039,9 @@ test('CAPTURE_REQUEST 完成后由 CAPTURE_SAVE 保存，compositions 只消费�
   const again = send({type: MESSAGE.CAPTURE_SAVE, taskId: 'task-1', payload: {format: 'png'}});
   assert.deepEqual(again, [{ok: false, code: ERROR_CODE.STALE_TASK,
     message: ERROR_MESSAGES[ERROR_CODE.STALE_TASK]}]);
+  // 登记表可能因 Service Worker 重启而丢失；此时要顺手释放离屏旧会话，否则下次截图永久 stale
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(calls.some(([name, type]) => name === 'offscreen' && type === MESSAGE.COMPOSER_ABORT));
 });
 
 test('CAPTURE_DISCARD 释放离屏画布且拒绝其他标签页', async () => {
@@ -892,6 +1068,8 @@ test('CAPTURE_DISCARD 释放离屏画布且拒绝其他标签页', async () => {
 
   assert.deepEqual(send({type: MESSAGE.CAPTURE_DISCARD, taskId: 'task-1'}, {id: 99}),
     [{ok: false, code: ERROR_CODE.STALE_TASK, message: ERROR_MESSAGES[ERROR_CODE.STALE_TASK]}]);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(calls.includes(MESSAGE.COMPOSER_ABORT), false, '其他标签页不得释放他人画布');
 
   const discarded = send({type: MESSAGE.CAPTURE_DISCARD, taskId: 'task-1'}, {id: 7, windowId: 3});
   await new Promise(resolve => setTimeout(resolve, 0));

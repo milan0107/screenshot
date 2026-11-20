@@ -54,8 +54,8 @@ test('adapts an internal scroll container and restores its locked state exactly'
     style: {scrollBehavior: 'smooth'},
     getBoundingClientRect: () => ({left: 100, top: 50})
   };
-  const previousDocument = globalThis.document;
-  globalThis.document = {scrollingElement: page};
+  const previous = {document: globalThis.document, innerWidth: globalThis.innerWidth, innerHeight: globalThis.innerHeight};
+  Object.assign(globalThis, {document: {scrollingElement: page}, innerWidth: 1000, innerHeight: 700});
 
   try {
     const surface = createSurface(element);
@@ -64,7 +64,9 @@ test('adapts an internal scroll container and restores its locked state exactly'
       scrollLeft: 30, scrollTop: 40,
       clientWidth: 300, clientHeight: 200, scrollHeight: 900,
       maxScrollTop: 700,
-      viewport: {left: 102, top: 53, width: 300, height: 200}
+      viewport: {left: 102, top: 53, width: 300, height: 200},
+      visible: {left: 102, top: 53, width: 300, height: 200},
+      window: {width: 1000, height: 700}
     });
     assert.deepEqual(surface.toContentPoint(122, 73), {x: 50, y: 60});
     assert.deepEqual(surface.clampClientPoint(50, 500), {x: 102, y: 253});
@@ -77,7 +79,32 @@ test('adapts an internal scroll container and restores its locked state exactly'
     assert.equal(element.scrollLeft, 30);
     assert.equal(element.scrollTop, 40);
   } finally {
-    globalThis.document = previousDocument;
+    Object.assign(globalThis, previous);
+  }
+});
+
+test('clips the visible area of a container that extends past the window', () => {
+  const page = {};
+  const element = {
+    scrollLeft: 0, scrollTop: 0,
+    clientWidth: 1000, clientHeight: 900, scrollHeight: 4000,
+    clientLeft: 0, clientTop: 0,
+    style: {scrollBehavior: ''},
+    getBoundingClientRect: () => ({left: 0, top: 56})
+  };
+  const previous = {document: globalThis.document, innerWidth: globalThis.innerWidth, innerHeight: globalThis.innerHeight};
+  Object.assign(globalThis, {document: {scrollingElement: page}, innerWidth: 1184, innerHeight: 705});
+  try {
+    const surface = createSurface(element);
+    const metrics = surface.getMetrics();
+    assert.deepEqual(metrics.viewport, {left: 0, top: 56, width: 1000, height: 900});
+    // 只能截到窗口内的 56..705，分帧步长必须用 649 而不是 900
+    assert.deepEqual(metrics.visible, {left: 0, top: 56, width: 1000, height: 649});
+    // 拖拽点同样只能落在「容器 ∩ 窗口」内，否则会框出永远截不到的区域
+    assert.deepEqual(surface.clampClientPoint(-10, -10), {x: 0, y: 56});
+    assert.deepEqual(surface.clampClientPoint(2000, 2000), {x: 1000, y: 705});
+  } finally {
+    Object.assign(globalThis, previous);
   }
 });
 
@@ -147,6 +174,8 @@ test('adapts the page scrolling element', () => {
     const surface = createSurface(page);
     assert.equal(surface.kind, 'page');
     assert.deepEqual(surface.getMetrics().viewport, {left: 0, top: 0, width: 1000, height: 700});
+    assert.deepEqual(surface.getMetrics().visible, {left: 0, top: 0, width: 1000, height: 700});
+    assert.deepEqual(surface.getMetrics().window, {width: 1000, height: 700});
     assert.deepEqual(surface.toContentPoint(10, 20), {x: 30, y: 100});
     surface.lock();
     surface.setScrollTop(250);

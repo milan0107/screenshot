@@ -286,7 +286,17 @@ export function registerServiceWorker(chromeApi, capture = runCapture, logger = 
     if (message.type === MESSAGE.CAPTURE_SAVE || message.type === MESSAGE.CAPTURE_COPY
       || message.type === MESSAGE.CAPTURE_DISCARD) {
       const entry = compositions.get(message.taskId);
-      if (!entry || entry.tabId !== sender.tab?.id) {
+      if (!entry) {
+        // compositions 是内存表：MV3 Service Worker 可能已被回收，导致离屏文档里
+        // 仍有没人认领的旧会话。此时顺手发一次 ABORT，避免后续 COMPOSER_BEGIN
+        // 一直被判 stale 而永久无法再截图。不是本任务时不这么做（可能属于其他标签页）。
+        void Promise.resolve()
+          .then(() => chromeApi.runtime.sendMessage(makeMessage(MESSAGE.COMPOSER_ABORT, message.taskId)))
+          .catch(() => {});
+        sendResponse({ok: false, code: ERROR_CODE.STALE_TASK, message: ERROR_MESSAGES[ERROR_CODE.STALE_TASK]});
+        return false;
+      }
+      if (entry.tabId !== sender.tab?.id) {
         sendResponse({ok: false, code: ERROR_CODE.STALE_TASK, message: ERROR_MESSAGES[ERROR_CODE.STALE_TASK]});
         return false;
       }
@@ -337,9 +347,10 @@ export function registerServiceWorker(chromeApi, capture = runCapture, logger = 
         logger.error('长截图任务失败', error);
         const code = ERROR_MESSAGES[error?.code] ? error.code : ERROR_CODE.CAPTURE_FAILED;
         // CAPTURE_FAILED 时把阶段与原因带出来，否则只能看到「截图失败，请重试」无从定位。
+        // 其他错误（尤其 SURFACE_CHANGED）带上具体变化的指标和差值。
         const detail = code === ERROR_CODE.CAPTURE_FAILED
           ? `（${error?.stage ?? '未知阶段'}：${error?.message ?? '未知原因'}）`
-          : '';
+          : error?.details ? `（${error.details}）` : '';
         const userMessage = `${ERROR_MESSAGES[code]}${detail}`;
         await chromeApi.tabs.sendMessage(tabId, makeMessage(MESSAGE.ERROR, message.taskId, {
           code, message: userMessage
