@@ -4,7 +4,13 @@ import {normalizeRect} from '../src/shared/geometry.js';
 import {makeMessage, MESSAGE} from '../src/shared/protocol.js';
 import {createSelectionController} from '../src/content/selection-ui.js';
 
-function createHarness({sendMessage: suppliedSendMessage} = {}) {
+function createHarness({
+  sendMessage: suppliedSendMessage,
+  elementsFromPoint,
+  findScrollSurface: suppliedFindScrollSurface,
+  surfaceMetrics,
+  cancelCapture: suppliedCancelCapture
+} = {}) {
   const log = [];
   const messages = [];
   const uis = [];
@@ -24,7 +30,8 @@ function createHarness({sendMessage: suppliedSendMessage} = {}) {
       toContentPoint: (x, y) => ({x, y: y + scrollTop}),
       getMetrics: () => ({
         scrollLeft: 0, scrollTop, maxScrollTop: 800,
-        viewport: {left: 0, top: 0, width: 300, height: 200}
+        viewport: {left: 0, top: 0, width: 300, height: 200},
+        ...(typeof surfaceMetrics === 'function' ? surfaceMetrics(scrollTop) : surfaceMetrics)
       }),
       setScrollTop(top) {
         scrollTop = top;
@@ -49,18 +56,27 @@ function createHarness({sendMessage: suppliedSendMessage} = {}) {
         setVisible: (visible) => log.push(`visible:${visible}`),
         setMode: (highQuality, pending) => log.push(`mode:${highQuality}${pending ? ':pending' : ''}`),
         setFormat: (format) => log.push(`format:${format}`),
-        showSelection: (rect) => log.push(`rect:${rect.left},${rect.top},${rect.right},${rect.bottom}`)
+        showSelection: (rect, visible) => {
+          log.push(`rect:${rect.left},${rect.top},${rect.right},${rect.bottom}`);
+          log.push(`visible-region:${visible.left},${visible.top},${visible.width},${visible.height}`);
+        }
       };
       uis.push(ui);
       return ui;
     },
     createSurface: createFakeSurface,
-    findScrollSurface: (target) => target,
+    findScrollSurface: suppliedFindScrollSurface ?? (target => target),
     normalizeRect,
     makeMessage,
     MESSAGE,
-    document: {elementsFromPoint: () => [{id: 'target'}]},
+    document: {elementsFromPoint: elementsFromPoint ?? (() => [{id: 'target'}])},
     randomUUID: () => `task-${++taskNumber}`,
+    ...(suppliedCancelCapture ? {
+      cancelCapture(taskId) {
+        log.push(`cancel-capture:${taskId}`);
+        suppliedCancelCapture(taskId);
+      }
+    } : {}),
     sendMessage(message) {
       messages.push(message);
       log.push(`send:${message.type}`);
@@ -237,6 +253,20 @@ test('Esc 取消进行中的截图任务，并在已拼接时改为丢弃', asyn
   assert.equal(second.messages.at(-1).type, MESSAGE.CAPTURE_DISCARD);
 });
 
+test('Esc 取消进行中任务时优先走 capture handler 快速通道', () => {
+  const {controller, log, messages, uis} = createHarness({
+    cancelCapture: taskId => log.push(`handler-cancel:${taskId}`)
+  });
+  controller.enterSelection();
+  selectAndConfirm(uis[0]);
+  log.length = 0;
+
+  controller.handleKeyDown({key: 'Escape', preventDefault() {}});
+
+  assert.ok(log.includes('handler-cancel:task-1'));
+  assert.equal(messages.some(message => message.type === MESSAGE.CANCEL), false);
+});
+
 test('截图完成后关闭菜单会解锁本地滚动表面', async () => {
   const {controller, log, uis} = createHarness();
   controller.enterSelection();
@@ -403,6 +433,34 @@ test('保存/复制失败时给出提示而不是静默关闭', async () => {
   assert.ok(log.some(entry => entry.startsWith('remove:')));
 });
 
+test('复制超限时保留菜单和任务，用户可直接改用保存', async () => {
+  const {controller, log, messages, uis} = createHarness({
+    sendMessage: message => Promise.resolve(
+      message.type === MESSAGE.CAPTURE_COPY
+        ? {ok: false, code: 'COPY_TOO_LARGE', message: '截图过大，无法复制到剪贴板，请改用「保存」'}
+        : {ok: true}
+    )
+  });
+  controller.enterSelection();
+  selectAndConfirm(uis[0]);
+  await flush();
+
+  log.length = 0;
+  uis[0].callbacks.onCopy();
+  await flush();
+
+  assert.ok(log.includes('action-failed:截图过大，无法复制到剪贴板，请改用「保存」'));
+  assert.ok(log.includes('visible:true'));
+  assert.ok(log.some(entry => entry.startsWith('actions:')));
+  assert.equal(log.some(entry => entry.startsWith('remove:')), false, '复制超限不能关闭菜单');
+
+  uis[0].callbacks.onSave();
+  await flush();
+  const save = messages.at(-1);
+  assert.equal(save.type, MESSAGE.CAPTURE_SAVE);
+  assert.equal(save.taskId, 'task-1');
+});
+
 test('保存请求被拒绝（消息通道异常）时也给出提示', async () => {
   let calls = 0;
   const {controller, log, uis} = createHarness({
@@ -460,6 +518,21 @@ test('controller auto-scrolls at 28 pixels per frame at the surface edge', () =>
   assert.equal(frames.size, 1);
   uis[0].callbacks.onPointerUp(pointer(20, 200));
   assert.equal(frames.size, 0);
+});
+
+test('选框绘制区域扣除顶部导航遮挡高度', () => {
+  const {controller, log, uis} = createHarness({
+    surfaceMetrics: {
+      visible: {left: 0, top: 0, width: 300, height: 200},
+      overlayInset: 40
+    }
+  });
+  controller.enterSelection();
+  uis[0].callbacks.onPointerDown(pointer(10, 50));
+  uis[0].callbacks.onPointerMove(pointer(40, 100));
+
+  assert.ok(log.includes('visible-region:0,40,300,160'));
+  uis[0].callbacks.onPointerUp(pointer(40, 100));
 });
 
 test('从上边缘附近开始向下框选时不会反向向上自动滚动', () => {
@@ -538,4 +611,22 @@ test('过小选区不会触发截图', () => {
   uis[0].callbacks.onPointerUp(pointer(10, 20));
 
   assert.deepEqual(messages, []);
+});
+
+test('提示条覆盖处起拖仍命中其下方的滚动容器', () => {
+  const feedback = {dataset: {longshotCapture: ''}};
+  const container = {id: 'container'};
+  let found = null;
+  const {controller, uis} = createHarness({
+    elementsFromPoint: () => [feedback, container],
+    findScrollSurface: target => {
+      found = target;
+      return target;
+    }
+  });
+  controller.enterSelection();
+
+  uis[0].callbacks.onPointerDown(pointer(10, 20));
+
+  assert.equal(found, container);
 });

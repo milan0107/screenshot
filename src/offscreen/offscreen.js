@@ -1,5 +1,5 @@
 import {JPEG_BACKGROUND, JPEG_QUALITY, mimeTypeFor, normalizeOutputFormat} from '../shared/formats.js';
-import { validateOutput } from '../shared/limits.js';
+import {MAX_CLIPBOARD_DATA_URL_CHARS, validateOutput} from '../shared/limits.js';
 import { ERROR_CODE, MESSAGE, OUTPUT_FORMAT } from '../shared/protocol.js';
 
 function codedError(code, message) {
@@ -17,6 +17,8 @@ export class ComposerSession {
     this.canvas = null;
     this.context = null;
     this.objectUrl = null;
+    /** begin 的首帧位图：首个 add 的数据与它相同，缓存下来避免整张视口图解码两次。 */
+    this.firstFrame = null;
     this.state = 'idle';
     this.generation = 0;
   }
@@ -54,6 +56,8 @@ export class ComposerSession {
       context.fillRect(0, 0, width, height);
       this.#requireGeneration(generation);
       this.context = context;
+      this.firstFrame = {dataUrl: firstDataUrl, bitmap};
+      bitmap = null;   // 所有权移交 firstFrame，由首个 add 或清理路径关闭
       this.state = 'begun';
       return { scaleX, scaleY, width, height };
     } catch (error) {
@@ -73,7 +77,15 @@ export class ComposerSession {
     this.state = 'adding';
     let bitmap;
     try {
-      bitmap = await this.decodeImage(dataUrl);
+      // 只有数据与 begin 首帧完全一致时才复用缓存（协议保证首帧 add 与 begin
+      // 用同一张图），其余情况照常解码，避免把别帧画错位置。
+      let cached = this.firstFrame;
+      this.firstFrame = null;
+      if (cached && cached.dataUrl !== dataUrl) {
+        cached.bitmap?.close?.();
+        cached = null;
+      }
+      bitmap = cached ? cached.bitmap : await this.decodeImage(dataUrl);
       this.#requireGeneration(generation);
       if (this.state !== 'adding') throw new Error('Composer operation invalidated');
       const { sx, sy, sw, sh, dx, dy, dw, dh } = placement;
@@ -172,6 +184,10 @@ export class ComposerSession {
   }
 
   #clearResources() {
+    if (this.firstFrame) {
+      this.firstFrame.bitmap?.close?.();
+      this.firstFrame = null;
+    }
     if (this.objectUrl) {
       this.revokeObjectURL(this.objectUrl);
       this.objectUrl = null;
@@ -277,6 +293,14 @@ export function createComposerMessageHandler(session) {
         case MESSAGE.COMPOSER_EXPORT: {
           const dataUrl = session.exportDataUrl();
           if (!isCurrent(taskId, operationGeneration)) return staleResponse();
+          // 超过消息通道上限的 dataURL 不能再回传给 Service Worker，
+          // 否则 runtime.sendMessage 会抛 "message length exceeded"，
+          // 后台还会误判离屏文档失效并重置画布。这里直接返回小体积错误，
+          // 画布保持可用，用户可以改用「保存」。
+          if (dataUrl.length > MAX_CLIPBOARD_DATA_URL_CHARS) {
+            return serializedError(codedError(ERROR_CODE.COPY_TOO_LARGE,
+              '截图过大，无法复制到剪贴板，请改用「保存」'));
+          }
           return { ok: true, dataUrl };
         }
         default:

@@ -104,10 +104,10 @@ docs/superpowers/              设计与实施计划文档
 - **失败可见**：保存/复制失败（离屏会话失效、磁盘拒绝等）会在页面顶部提示，而不是静默收起菜单。
 - **自愈**：离屏文档可能被浏览器回收（或被重载扩展留下失效上下文），此时 `runtime.sendMessage` 抛 “Receiving end does not exist”。`sendOffscreen` 会重建离屏文档并重试一次。Service Worker 被回收会丢失待处理任务登记，保存/复制失败或新任务开始时也会顺手 `COMPOSER_ABORT` 旧会话，避免后续截图一直 `STALE_TASK`。
 - **失败可定位**：`CAPTURE_FAILED` 的提示条会附带失败阶段与原始原因，例如「截图失败，请重试。（capture#2/3：Could not establish connection）」，无需翻控制台即可反馈问题。
-- **恢复兜底**：`finally` 中依次结算在飞截图 → `COMPOSER_ABORT` → `RESTORE_PAGE`，每步都有超时；原始错误优先于恢复错误。
+- **恢复兜底**：`finally` 中依次结算在飞截图 → `COMPOSER_ABORT` → `RESTORE_PAGE`，每步都有超时；原始错误优先于恢复错误。页面侧另有 120s 看门狗，扩展重载/Service Worker 失联时会自动释放输入拦截；取消请求被后台判定为「任务已丢失」时也会立即本地解锁。
 - **两段式任务**：`CAPTURE_REQUEST` 只负责拼接，完成后不下载、不释放画布，并把 `taskId` 登记到 Service Worker 的 `compositions`；用户随后发 `CAPTURE_SAVE`（按格式下载）/ `CAPTURE_COPY`（写剪贴板）/ `CAPTURE_DISCARD`（丢弃）时才真正消费，每条任务只能消费一次，标签页关闭或新任务开始时自动丢弃。
 - **高清缩放**：`ENABLE_HIGH_QUALITY` 由 Service Worker 按标签页串行读写 zoom（`createHighQualitySessionManager`），原缩放值回传内容脚本保存；截图时 `runCapture` 的 `finally` 负责恢复，未截图就退出则由内容脚本发 `DISABLE_HIGH_QUALITY` 恢复。
-- **复制到剪贴板**：`COMPOSER_EXPORT` 取 `canvas.toDataURL('image/png')`（Chrome 的 `ClipboardItem` 写图片只稳定支持 PNG）→ `CLIPBOARD_WRITE` 到内容脚本，由页面侧 `navigator.clipboard.write` 写入（http 等非安全上下文回退 `copy` 事件）；写入失败以中文错误提示。
+- **复制到剪贴板**：`COMPOSER_EXPORT` 取 `canvas.toDataURL('image/png')`（Chrome 的 `ClipboardItem` 写图片只稳定支持 PNG）→ `CLIPBOARD_WRITE` 到内容脚本，由页面侧 `navigator.clipboard.write` 写入（http 等非安全上下文回退 `copy` 事件）；写入失败以中文错误提示。超过消息通道上限的超长图会提前提示改用「保存」，不再只报一句「截图失败」。
 
 ## 打包（CRX / ZIP）
 
@@ -130,7 +130,7 @@ docs/superpowers/              设计与实施计划文档
 npm test          # node --test tests/*.test.js
 ```
 
-共 207 个用例，覆盖几何换算、分段生成、输出上限、格式映射、滚动表面适配、PageStateGuard（含 shadow DOM 浮层与快门坐标）、选区控制器、消息处理器、Composer 状态机、后台捕获编排、后处理（保存/复制/丢弃）、高清缩放会话、选区确认与手柄调整、清单校验。全部为无 DOM 的依赖注入单测，不启动真实浏览器。
+共 233 个用例，覆盖几何换算、分段生成、输出上限、格式映射、滚动表面适配、PageStateGuard（含 shadow DOM 浮层与快门坐标）、选区控制器、消息处理器、Composer 状态机、后台捕获编排、后处理（保存/复制/丢弃）、高清缩放会话、选区确认与手柄调整、清单校验。全部为无 DOM 的依赖注入单测，不启动真实浏览器。
 
 ## 人工验收清单
 
@@ -153,16 +153,18 @@ npm test          # node --test tests/*.test.js
 - [ ] 各阶段（画质→确认→输出）切换时，变宽的菜单会被自动收回视口内，不会被右侧裁掉
 - [ ] 边缘自动滚动速度自然，拖动跨多屏时选区连续、不跳变；从顶部附近开始向下框选不会反向向上滚动、不会把起点以上内容扩进选区
 - [ ] 普通长页面：输出图片尺寸与选区一致，无重复、断层、错位
+- [ ] 顶部有 sticky/fixed 导航的长页面：选框顶部停在导航下沿，滚动后不会把导航或选区上方内容截入
 - [ ] 格式切到 JPG：下载文件为 `.jpg`，无黑色/透明空洞（白底），体积明显小于同尺寸 PNG
 - [ ] 格式切回 PNG：下载文件为 `.png`，透明背景保留
 - [ ] 「复制到剪贴板」：不弹保存窗口，在聊天/文档里 `Ctrl+V` 能粘出完整长图
 - [ ] 「复制到剪贴板」成功后页面顶部提示「已复制到剪贴板」，约 2.4 秒后自动消失
+- [ ] 超长图复制提示改用「保存」时，操作菜单仍保留，可直接继续保存
 - [ ] 在 http 页面（非安全上下文）上复制仍能成功（回退 copy 事件）
 - [ ] 内部滚动容器：选区被限制在容器可见边界内，截图内容正确
 - [ ] 内部容器超出窗口（例如上方有固定头部、容器高 100vh）：选区夹在窗口内，长图无空白带/白边
 - [ ] 从页面/容器中部开始选取，首尾分段裁剪正确
 - [ ] 高分屏（devicePixelRatio > 1）与 125%/150% 页面缩放下坐标正确，多帧接缝无 1px 白线
-- [ ] 从固定导航栏/吸顶表头下方开始框选：成品里不出现它们；从它们上面开始框选：只在首帧出现一次
+- [ ] 从固定导航栏/吸顶表头下方开始框选：成品里不出现它们，滚动时选框顶部停在导航下沿而不是视口最顶部
 - [ ] 懒加载图片：滚动后加载完成的图片出现在正确位置
 - [ ] 虚拟列表页面（X/Twitter 时间线）：分段滚动后不出现整段纯白/未挂载区域
 - [ ] 滚动到底部不足一屏时，末段高度正确

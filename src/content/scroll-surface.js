@@ -73,6 +73,72 @@ function stickyPinned(rect, style, viewport) {
     && Math.abs(rect.bottom - (viewport.top + viewport.height - bottom)) <= 2;
 }
 
+/** 收集 fixed/sticky 元素（含 open shadow root），供可见区偏移计算复用。 */
+function collectOverlayCandidates(ownerDocument, readStyle, surfaceElement = null) {
+  if (!ownerDocument?.querySelectorAll || typeof readStyle !== 'function') return [];
+  const candidates = [];
+  const roots = [ownerDocument];
+  const seenRoots = new Set();
+  const seenElements = new Set();
+  while (roots.length) {
+    const root = roots.pop();
+    if (!root || seenRoots.has(root)) continue;
+    seenRoots.add(root);
+    for (const element of root.querySelectorAll?.('*') ?? []) {
+      if (seenElements.has(element)) continue;
+      seenElements.add(element);
+      if (element.shadowRoot) roots.push(element.shadowRoot);
+      // 包含滚动表面的 fixed 应用壳不是「顶部导航」：把它扣掉会让整个
+      // 内部滚动容器都不可选。只跳过祖先，不跳过表面内部的 fixed 浮层。
+      if (surfaceElement && (element === surfaceElement || element.contains?.(surfaceElement))) continue;
+      const style = readStyle(element);
+      if (style?.position === 'fixed' || style?.position === 'sticky') {
+        candidates.push({element, style});
+      }
+    }
+  }
+  return candidates;
+}
+
+/**
+ * 顶部固定导航/横幅会盖住滚动内容。它不属于可选区，必须从选区可见区里扣掉，
+ * 否则滚动后选框顶部会被夹到视口最顶部、盖住导航。
+ * 只统计横跨可见区一半以上、贴顶且可见的浮层，避免把右下角悬浮按钮算进来。
+ */
+function topOverlayInset(candidates, viewport, visibleTop = Math.max(0, viewport.top),
+  visibleRect = viewport) {
+  if (visibleRect.width <= 0 || visibleRect.height <= 0) return 0;
+  const visibleLeft = visibleRect.left;
+  const visibleRight = visibleRect.left + visibleRect.width;
+  const entries = [];
+  for (const {element, style} of candidates) {
+    const rect = element.getBoundingClientRect?.();
+    if (!rect) continue;
+    // 只统计真正覆盖「可见区」的浮层：离屏抽屉、另一栏的 fixed 条
+    // 即使宽度很大，也不应该把选区顶部整体下移。
+    const overlap = Math.min(rect.right, visibleRight) - Math.max(rect.left, visibleLeft);
+    if (overlap < visibleRect.width * 0.5) continue;
+    if (rect.width < visibleRect.width * 0.5) continue;
+    if (rect.bottom <= visibleTop) continue;
+    // 全屏 fixed 布局壳/遮罩不是顶部导航。若把它整屏都扣掉，选区可见区
+    // 只剩 1px。只接受高度不超过 max(320px, 半屏) 的顶部浮层；短视口下
+    // 仍允许 320px 以内的正常导航。
+    if (rect.height > Math.max(320, viewport.height * 0.5)) continue;
+    if (style.position === 'sticky' && !stickyPinned(rect, style, viewport)) continue;
+    if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
+    entries.push(rect);
+  }
+  // 多层吸顶导航（如 59px 主栏 + 52px 工具栏）需要按堆叠顺序累计。
+  entries.sort((a, b) => a.top - b.top);
+  let inset = 0;
+  for (const rect of entries) {
+    if (rect.top > visibleTop + inset + 2) continue;
+    if (rect.bottom <= visibleTop + inset) continue;
+    inset = Math.max(inset, rect.bottom - visibleTop);
+  }
+  return Math.min(Math.max(0, inset), Math.max(0, viewport.height - 1));
+}
+
 /** Capture-only mutations that must be unwound even if the capture task fails. */
 export class PageStateGuard {
   constructor({surface, document: ownerDocument = document, getComputedStyle: readStyle, selectionStart = null}) {
@@ -202,8 +268,9 @@ export class PageStateGuard {
       const entry = this.visibility.get(element);
       return entry?.initiallyPinned === true || metrics.scrollTop > this.state.metrics.scrollTop;
     });
+    const repeatedSet = new Set(repeated);
     for (const element of this.repeatedElements) {
-      if (!repeated.includes(element)) {
+      if (!repeatedSet.has(element)) {
         const saved = this.visibility.get(element);
         restoreElement(element, saved);
       }
@@ -300,6 +367,12 @@ export class PageStateGuard {
 export function createSurface(element) {
   const isPage = element === document.scrollingElement;
   let lockedState = null;
+  const ownerDocument = isPage ? document : element.ownerDocument ?? document;
+  const overlayCandidates = collectOverlayCandidates(
+    ownerDocument,
+    globalThis.getComputedStyle?.bind(globalThis),
+    element
+  );
 
   function readScrollBehavior() {
     if (typeof element.style.getPropertyValue === 'function') {
@@ -348,6 +421,10 @@ export function createSurface(element) {
     return {left, top, width: right - left, height: bottom - top};
   }
 
+  function readTopOverlayInset(viewport = getViewport()) {
+    return topOverlayInset(overlayCandidates, viewport, Math.max(0, viewport.top), clipToWindow(viewport));
+  }
+
   function setPosition(left, top) {
     if (isPage) scrollTo(left, top);
     else {
@@ -363,6 +440,13 @@ export function createSurface(element) {
     getMetrics() {
       const {scrollLeft, scrollTop} = getScrollPosition();
       const viewport = getViewport();
+      const windowVisible = clipToWindow(viewport);
+      // 顶部导航只影响选框绘制与拖拽范围，不属于 captureVisibleTab 的
+      // 可截取范围。截图时导航会被 PageStateGuard 隐藏，其下方的页面内容
+      // 正是选区起点，因此 visible 必须保持「视口 ∩ 窗口」的原始含义。
+      // 若把导航高度算进 visible，隐藏导航后 visible 会突变，截图会被
+      // 误判为页面变化而失败。
+      const overlayInset = Math.min(readTopOverlayInset(viewport), Math.max(0, windowVisible.height - 1));
       const clientWidth = isPage ? innerWidth : element.clientWidth;
       const clientHeight = isPage ? innerHeight : element.clientHeight;
       return {
@@ -373,10 +457,14 @@ export function createSurface(element) {
         scrollHeight: element.scrollHeight,
         maxScrollTop: Math.max(0, element.scrollHeight - clientHeight),
         viewport,
-        // 窗口内**实际可见**的那部分（客户端坐标）：captureVisibleTab 只能截到这一块。
-        // 内部容器可能被窗口裁掉一部分（如 height:100vh 且上方有 56px 头部），
-        // 分帧步长与裁剪源矩形都必须按它算，否则每帧会多出空白或把内容压扁。
-        visible: clipToWindow(viewport),
+        // 窗口内**实际可见**的那部分（客户端坐标）：captureVisibleTab 只能
+        // 截到这一块。内部容器可能被窗口裁掉一部分（如 height:100vh 且上方
+        // 有 56px 头部），分帧步长与裁剪源矩形都必须按它算，否则每帧会多出
+        // 空白或把内容压扁。
+        visible: windowVisible,
+        // 顶部固定导航/横幅在 visible 内额外遮挡的高度；仅用于选框绘制和
+        // 指针夹紧，不参与截图裁剪。
+        overlayInset,
         // captureVisibleTab 截的是整个标签页视口，裁剪比例必须用它换算，
         // 不能用内部滚动容器的尺寸（见 computeFramePlacement 的 scaleX/scaleY）。
         window: {width: innerWidth, height: innerHeight}
@@ -401,12 +489,14 @@ export function createSurface(element) {
       const viewport = getViewport();
       // 只能截到「滚动表面可视区 ∩ 浏览器窗口」：拖拽时指针可以越出窗口，
       // 若不夹紧，选区会包含永远截不到的内容，成品边缘出现白边。
-      const left = Math.max(viewport.left, 0);
-      const top = Math.max(viewport.top, 0);
-      const right = Math.max(left, Math.min(viewport.left + viewport.width, innerWidth));
-      const bottom = Math.max(top, Math.min(viewport.top + viewport.height, innerHeight));
+      const visible = clipToWindow(viewport);
+      // 顶部固定导航盖住的内容不属于可选区，指针不能落在导航上。
+      const inset = Math.min(readTopOverlayInset(viewport), Math.max(0, visible.height - 1));
+      const top = visible.top + inset;
+      const right = visible.left + visible.width;
+      const bottom = visible.top + visible.height;
       return {
-        x: Math.min(Math.max(clientX, left), right),
+        x: Math.min(Math.max(clientX, visible.left), right),
         y: Math.min(Math.max(clientY, top), bottom)
       };
     },

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {PageStateGuard} from '../src/content/scroll-surface.js';
+import {createSurface, PageStateGuard} from '../src/content/scroll-surface.js';
 import {createCaptureFeedback} from '../src/content/selection-ui.js';
 
 class FakeStyle {
@@ -369,6 +369,74 @@ test('PageStateGuard 在内部容器的窗口视口变化时判为表面变化',
 
   assert.throws(() => guard.assertStable(), error => error.code === 'SURFACE_CHANGED');
   guard.restore();
+});
+
+test('隐藏吸顶导航不会改变可截取视口，否则截图会误判页面变化', () => {
+  const page = {
+    scrollWidth: 1000, scrollHeight: 3000,
+    clientWidth: 1000, clientHeight: 700,
+    style: new FakeStyle()
+  };
+  const header = {
+    style: new FakeStyle({visibility: 'visible'}),
+    getBoundingClientRect: () => ({left: 0, top: 0, right: 1000, bottom: 111, width: 1000, height: 111})
+  };
+  const listeners = [];
+  const ownerDocument = {
+    scrollingElement: page,
+    querySelectorAll: () => [header],
+    addEventListener: (...args) => listeners.push(args),
+    removeEventListener: (...args) => listeners.push(['remove', ...args])
+  };
+  const getStyle = element => element === header
+    ? {
+      position: 'sticky', top: '0px', display: 'block',
+      visibility: header.style.getPropertyValue('visibility') || 'visible',
+      opacity: header.style.getPropertyValue('opacity') || '1'
+    }
+    : {position: 'static'};
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    innerWidth: globalThis.innerWidth,
+    innerHeight: globalThis.innerHeight,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY,
+    scrollTo: globalThis.scrollTo
+  };
+  Object.assign(globalThis, {
+    document: ownerDocument,
+    getComputedStyle: getStyle,
+    innerWidth: 1000, innerHeight: 700,
+    scrollX: 0, scrollY: 0,
+    scrollTo: (x, y) => { globalThis.scrollX = x; globalThis.scrollY = y; }
+  });
+
+  try {
+    const surface = createSurface(page);
+    const guard = new PageStateGuard({
+      surface,
+      document: ownerDocument,
+      getComputedStyle: getStyle,
+      selectionStart: {x: 10, y: 300}
+    });
+    guard.prepare();
+    assert.equal(surface.getMetrics().overlayInset, 111);
+
+    // 模拟第一帧：页面滚动后导航吸顶，进入重复浮层列表并被隐藏。
+    globalThis.scrollY = 189;
+    guard.refreshRepeatedElements();
+    guard.setRepeatedElementsVisible(true);
+    assert.equal(header.style.getPropertyValue('visibility'), 'hidden');
+
+    // visible 是截图的裁剪范围，不能因为导航被隐藏而突变。
+    assert.deepEqual(surface.getMetrics().visible,
+      {left: 0, top: 0, width: 1000, height: 700});
+    assert.doesNotThrow(() => guard.assertStable());
+    guard.restore();
+  } finally {
+    Object.assign(globalThis, previous);
+  }
 });
 
 test('固定元素只有覆盖框选起点时才在首帧保留', () => {

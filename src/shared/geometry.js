@@ -49,3 +49,10 @@ export function computeFramePlacement({selection, scrollLeft, scrollTop, viewpor
     dw, dh
   };
 }
+
+/** 滚动表面顶部相对 window 顶部的偏移；两者相同时为 0。 */
+export function visibleTopInset(metrics) {
+  const viewportTop = Number.isFinite(metrics?.viewport?.top) ? metrics.viewport.top : 0;
+  const visibleTop = Number.isFinite(metrics?.visible?.top) ? metrics.visible.top : viewportTop;
+  return visibleTop - viewportTop;
+}

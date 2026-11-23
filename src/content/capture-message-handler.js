@@ -1,16 +1,12 @@
 /** Task-scoped production handler, kept dependency-injected for DOM-free tests. */
 const NOTICE_MS = 2_400;
 const SETTLE_IMAGE_WAIT_MS = 300;
+/** 后台失联（扩展重载/SW 崩溃）时自动释放页面状态，防止输入拦截器永久锁死页面。 */
+const CAPTURE_WATCHDOG_MS = 120_000;
 
 /** 离屏拼接消息类型；它们由 offscreen 文档处理，页面侧必须无视（不得应答）。 */
 const COMPOSER_TYPES = new Set(['COMPOSER_BEGIN', 'COMPOSER_ADD', 'COMPOSER_FINISH',
   'COMPOSER_EXPORT', 'COMPOSER_RELEASE', 'COMPOSER_ABORT']);
-
-function visibleTopInset(metrics) {
-  const viewportTop = Number.isFinite(metrics?.viewport?.top) ? metrics.viewport.top : 0;
-  const visibleTop = Number.isFinite(metrics?.visible?.top) ? metrics.visible.top : viewportTop;
-  return visibleTop - viewportTop;
-}
 
 export async function waitForScrollSettle({
   document: ownerDocument = document,
@@ -44,7 +40,7 @@ export async function waitForScrollSettle({
   });
 }
 
-export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrollTargets, createCaptureFeedback,
+export function createCaptureMessageHandler({MESSAGE, PageStateGuard, createCaptureFeedback,
   controller, document: ownerDocument, errorMessages = {}, sendMessage = () => {},
   writeClipboard = async () => { throw new Error('clipboard unavailable'); },
   setTimeout: scheduleTimeout = globalThis.setTimeout, clearTimeout: cancelTimeout = globalThis.clearTimeout,
@@ -54,7 +50,10 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
   let passiveFeedback = null;
   let pendingErrorTaskId = null;
   let pendingEnterSelection = false;
+  /** 用户主动再次进入选择态而取消的任务；后台随后补发的 CANCELLED 不应再弹提示。 */
+  let suppressedErrorTaskId = null;
   let noticeTimer = null;
+  let watchdogTimer = null;
   /** 最近一次成功恢复页面的任务；截图完成后用户仍可能请求复制，此时任务已不在进行中。 */
   let completedTaskId = null;
   const stale = () => ({ok: false, code: 'STALE_TASK', message: '截图任务已过期'});
@@ -77,6 +76,10 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
     }, noticeMs);
   };
   const release = ({expectError = false} = {}) => {
+    if (watchdogTimer !== null) {
+      cancelTimeout(watchdogTimer);
+      watchdogTimer = null;
+    }
     const taskId = capture?.taskId;
     capture?.guard?.restore();
     capture?.surface?.restore();
@@ -84,6 +87,45 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
     capture = null;
     pendingErrorTaskId = expectError ? taskId : null;
     if (!expectError && taskId) completedTaskId = taskId;
+  };
+  const armWatchdog = () => {
+    if (watchdogTimer !== null) cancelTimeout(watchdogTimer);
+    watchdogTimer = scheduleTimeout(() => {
+      watchdogTimer = null;
+      if (!capture) return;
+      const resumeSelection = pendingEnterSelection;
+      pendingEnterSelection = false;
+      const message = '截图超时，页面状态已恢复';
+      release({expectError: true});
+      if (resumeSelection) {
+        controller.enterSelection();
+        return;
+      }
+      passiveFeedback ??= createCaptureFeedback(ownerDocument);
+      passiveFeedback.showError?.(message);
+    }, CAPTURE_WATCHDOG_MS);
+  };
+  /** 后台已丢失该任务（SW 重启）或消息通道断开时，不再等 RESTORE_PAGE，立即本地解锁。 */
+  const releaseLostCapture = taskId => {
+    if (!activeFor(taskId)) return;
+    release({expectError: true});
+    if (pendingEnterSelection) {
+      pendingEnterSelection = false;
+      controller.enterSelection();
+    }
+  };
+  const requestCancel = taskId => {
+    let response;
+    try {
+      response = sendMessage({source: 'longshot', type: MESSAGE.CANCEL, taskId, payload: {}});
+    } catch {
+      releaseLostCapture(taskId);
+      return;
+    }
+    Promise.resolve(response).then(result => {
+      // 只有后台明确回答「没有这个任务」才立即解锁；undefined 表示发送端未回传结果。
+      if (result?.cancelled === false) releaseLostCapture(taskId);
+    }, () => releaseLostCapture(taskId));
   };
   return {
     dispose() {
@@ -95,13 +137,19 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
     onCaptureRequested(state) {
       release();
       completedTaskId = null;
-      capture = {...state, guard: null, feedback: createCaptureFeedback(ownerDocument), frame: 0, total: 0,
+      suppressedErrorTaskId = null;
+      capture = {...state, guard: null, feedback: createCaptureFeedback(ownerDocument), frame: 0,
         surfaceToken: state.surfaceToken};
+      armWatchdog();
     },
 
     /** 复制成功等一次性提示，自动消失。 */
     showNotice(message) {
       showPassive(message, {transient: true});
+    },
+    /** 选择 UI 取消任务时走这里：后台已无该任务可立即本地解锁。 */
+    cancelTask(taskId) {
+      requestCancel(taskId);
     },
     async handle(message) {
       // 防御：广播到达页面时不应答离屏拼接消息（否则会抢答导致后台误判截图失败）。
@@ -110,19 +158,32 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
         if (capture) {
           if (!pendingEnterSelection) {
             pendingEnterSelection = true;
-            sendMessage({source: 'longshot', type: MESSAGE.CANCEL, taskId: capture.taskId, payload: {}});
+            suppressedErrorTaskId = capture.taskId;
+            requestCancel(capture.taskId);
           }
           return {ok: true};
         }
         passiveFeedback?.remove(); passiveFeedback = null; clearNotice(); controller.enterSelection(); return {ok: true};
       }
       if (message.type === MESSAGE.ERROR) {
-        if (!message.taskId || activeFor(message.taskId) || message.taskId === pendingErrorTaskId) {
+        // 用户点扩展图标重新进入选择态时，后台会先发 RESTORE_PAGE、再补一条
+        // CANCELLED。这条错误是用户主动取消的结果，不应盖在新选框上。
+        if (message.taskId && message.taskId === suppressedErrorTaskId) {
+          suppressedErrorTaskId = null;
+          return {ok: true};
+        }
+        // completedTaskId 也要接收：拼接成功但页面恢复/缩放恢复失败时，后台是在
+        // RESTORE_PAGE（expectError:false）之后才报错的，任务已经「完成」了。
+        // 不接收的话这类错误会被静默丢弃，用户看到菜单消失却不知道截图已丢。
+        if (!message.taskId || activeFor(message.taskId) || message.taskId === pendingErrorTaskId
+          || message.taskId === completedTaskId) {
           const feedback = capture?.feedback ?? (passiveFeedback ??= createCaptureFeedback(ownerDocument));
           clearNotice();
           // 优先用后台下发的完整文案：SURFACE_CHANGED 会在括号里带上具体变化的指标。
           feedback.showError(message.payload?.message ?? errorMessages[message.payload?.code] ?? '截图失败，请重试');
           if (message.taskId === pendingErrorTaskId) pendingErrorTaskId = null;
+          // 完成后才报的错意味着结果已被后台丢弃（如缩放恢复失败），任务不再可复制。
+          if (message.taskId === completedTaskId) completedTaskId = null;
         }
         return {ok: true};
       }
@@ -156,10 +217,7 @@ export function createCaptureMessageHandler({MESSAGE, PageStateGuard, buildScrol
             document: ownerDocument,
             selectionStart: capture.startClientPoint
           });
-          const metrics = capture.guard.prepare();
-          capture.total = buildScrollTargets({selectionTop: capture.selection.top, selectionBottom: capture.selection.bottom,
-            viewportHeight: metrics.visible?.height ?? metrics.clientHeight, maxScrollTop: metrics.maxScrollTop,
-            topInset: visibleTopInset(metrics)}).length;
+          capture.guard.prepare();
         }
         return {ok: true, selection: capture.selection, metrics: capture.guard.assertStable(), surfaceToken: capture.surfaceToken};
       }

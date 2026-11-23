@@ -2,11 +2,23 @@
   const INSTANCE_KEY = '__longshotContentScriptController__';
   if (globalThis[INSTANCE_KEY]) return;
 
+  /** http 页面没有 crypto.randomUUID（仅安全上下文），降级用 getRandomValues 拼 UUID。 */
+  function randomUUID() {
+    if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
   let controller = null;
   let captureHandler = null;
   const ERROR_MESSAGES = {
     RESTRICTED_PAGE: '此页面不允许截图', SURFACE_CHANGED: '页面内容发生变化，请重新截取',
-    OUTPUT_TOO_LARGE: '截图尺寸过大，请缩小选区', CANCELLED: '截图已取消',
+    OUTPUT_TOO_LARGE: '截图尺寸过大，请缩小选区',
+    COPY_TOO_LARGE: '截图过大，无法复制到剪贴板，请改用「保存」', CANCELLED: '截图已取消',
     TIMEOUT: '截图超时，请缩小选区后重试'
   };
 
@@ -39,11 +51,10 @@
   const ready = Promise.all([
     import(chrome.runtime.getURL('src/shared/geometry.js')),
     import(chrome.runtime.getURL('src/shared/protocol.js')),
-    import(chrome.runtime.getURL('src/shared/segments.js')),
     import(chrome.runtime.getURL('src/content/scroll-surface.js')),
     import(chrome.runtime.getURL('src/content/selection-ui.js')),
     import(chrome.runtime.getURL('src/content/capture-message-handler.js'))
-  ]).then(([geometry, protocol, segments, scrollSurface, selection, handler]) => {
+  ]).then(([geometry, protocol, scrollSurface, selection, handler]) => {
     const {MESSAGE} = protocol;
     tabMessageTypes = new Set([
       MESSAGE.ENTER_SELECTION, MESSAGE.ERROR, MESSAGE.RESTORE_PAGE, MESSAGE.PREPARE_CAPTURE,
@@ -54,17 +65,18 @@
       findScrollSurface: scrollSurface.findScrollSurface, normalizeRect: geometry.normalizeRect,
       makeMessage: protocol.makeMessage, MESSAGE: protocol.MESSAGE, OUTPUT_FORMAT: protocol.OUTPUT_FORMAT,
       document,
-      randomUUID: () => crypto.randomUUID(), sendMessage: message => chrome.runtime.sendMessage(message),
+      randomUUID: () => randomUUID(), sendMessage: message => chrome.runtime.sendMessage(message),
+      cancelCapture: taskId => captureHandler?.cancelTask(taskId),
       requestAnimationFrame, cancelAnimationFrame,
-      onCaptureRequested: state => captureHandler?.onCaptureRequested({...state, surfaceToken: crypto.randomUUID()}),
+      onCaptureRequested: state => captureHandler?.onCaptureRequested({...state, surfaceToken: randomUUID()}),
       onCopied: () => captureHandler?.showNotice('已复制到剪贴板'),
       onActionFailed: message => captureHandler?.showNotice(message)
     });
     captureHandler = handler.createCaptureMessageHandler({MESSAGE: protocol.MESSAGE, PageStateGuard: scrollSurface.PageStateGuard,
-      buildScrollTargets: segments.buildScrollTargets, createCaptureFeedback: selection.createCaptureFeedback,
+      createCaptureFeedback: selection.createCaptureFeedback,
       controller, document, errorMessages: ERROR_MESSAGES,
       writeClipboard: writeClipboardImage,
-      sendMessage: message => { void chrome.runtime.sendMessage(message); }});
+      sendMessage: message => chrome.runtime.sendMessage(message)});
   });
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.source !== 'longshot') return false;

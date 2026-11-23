@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   ComposerSession, createComposerMessageHandler, registerComposerMessageListener
 } from '../src/offscreen/offscreen.js';
+import {MAX_CLIPBOARD_DATA_URL_CHARS} from '../src/shared/limits.js';
 import { MESSAGE } from '../src/shared/protocol.js';
 
 function deferred() {
@@ -61,7 +62,8 @@ test('begin measures the first image and creates the exact rounded output canvas
   assert.deepEqual(result, { scaleX: 2, scaleY: 2, width: 800, height: 1600 });
   assert.equal(harness.canvas.width, 800);
   assert.equal(harness.canvas.height, 1600);
-  assert.deepEqual(harness.calls.at(-1), ['close', 'data:first']);
+  // 首帧位图缓存给首个 add 复用，begin 结束时不再立即关闭。
+  assert.equal(harness.calls.some(call => call[0] === 'close'), false);
 });
 
 test('begin rejects oversized output with a serializable error code and closes its bitmap', async () => {
@@ -109,6 +111,33 @@ test('add draws using the bitmap and all eight placement arguments then closes i
   assert.equal(drawCall[1], harness.bitmaps[1]);
   assert.deepEqual(drawCall.slice(2), [1, 2, 3, 4, 5, 6, 7, 8]);
   assert.deepEqual(harness.calls.at(-1), ['close', 'data:frame']);
+});
+
+test('首个 add 复用 begin 缓存的位图，不重复解码', async () => {
+  const harness = createHarness();
+  const session = new ComposerSession(harness.dependencies);
+  await session.begin({ cssWidth: 400, cssHeight: 800, firstDataUrl: 'data:first', innerWidth: 600, innerHeight: 400 });
+
+  await session.add({
+    dataUrl: 'data:first',
+    placement: { sx: 1, sy: 2, sw: 3, sh: 4, dx: 5, dy: 6, dw: 7, dh: 8 }
+  });
+
+  // 只有 begin 那一次解码，首帧位图直接复用。
+  assert.deepEqual(harness.calls.filter(call => call[0] === 'decode'), [['decode', 'data:first']]);
+  const drawCall = harness.calls.find(call => call[0] === 'drawImage');
+  assert.equal(drawCall[1], harness.bitmaps[0]);
+  assert.deepEqual(harness.calls.at(-1), ['close', 'data:first']);
+});
+
+test('首帧缓存会在 release 时释放，不泄漏位图', async () => {
+  const harness = createHarness();
+  const session = new ComposerSession(harness.dependencies);
+  await session.begin({ cssWidth: 400, cssHeight: 800, firstDataUrl: 'data:first', innerWidth: 600, innerHeight: 400 });
+
+  session.abort();
+
+  assert.deepEqual(harness.calls.filter(call => call[0] === 'close'), [['close', 'data:first']]);
 });
 
 test('add closes a decoded bitmap when drawing fails', async () => {
@@ -207,6 +236,29 @@ test('message handler 支持 COMPOSER_EXPORT 导出 data URL', async () => {
   assert.deepEqual(await handleMessage({
     source: 'longshot', type: MESSAGE.COMPOSER_EXPORT, taskId: 'task-1', payload: {}
   }), { ok: true, dataUrl: 'data:image/png;base64,AAAA' });
+});
+
+test('COMPOSER_EXPORT 超过消息通道上限时返回 COPY_TOO_LARGE 并保留画布', async () => {
+  const harness = createHarness();
+  harness.canvas.toDataURL = () => 'A'.repeat(MAX_CLIPBOARD_DATA_URL_CHARS + 1);
+  const session = new ComposerSession(harness.dependencies);
+  const handleMessage = createComposerMessageHandler(session);
+  await handleMessage({
+    source: 'longshot', type: MESSAGE.COMPOSER_BEGIN, taskId: 'task-1',
+    payload: { cssWidth: 400, cssHeight: 800, firstDataUrl: 'data:first', innerWidth: 600, innerHeight: 400 }
+  });
+
+  const response = await handleMessage({
+    source: 'longshot', type: MESSAGE.COMPOSER_EXPORT, taskId: 'task-1', payload: {}
+  });
+
+  assert.deepEqual(response, {
+    ok: false, code: 'COPY_TOO_LARGE', message: '截图过大，无法复制到剪贴板，请改用「保存」'
+  });
+  assert.equal('dataUrl' in response, false);
+  assert.equal(session.state, 'begun');
+  // 画布仍然可用，用户可以继续保存。
+  assert.equal(await session.finish('png'), 'blob:longshot-result');
 });
 
 test('abort revokes output and clears canvas resources idempotently', async () => {

@@ -1,5 +1,6 @@
-import {computeFramePlacement} from '../shared/geometry.js';
+import {computeFramePlacement, visibleTopInset} from '../shared/geometry.js';
 import {extensionFor, normalizeOutputFormat} from '../shared/formats.js';
+import {MAX_CLIPBOARD_DATA_URL_CHARS} from '../shared/limits.js';
 import {ERROR_CODE, makeMessage, MESSAGE} from '../shared/protocol.js';
 import {buildScrollTargets} from '../shared/segments.js';
 
@@ -14,6 +15,7 @@ const HIGH_QUALITY_ZOOM = 1.5;
 const TASK_TIMEOUT_MS = 60_000;
 const CLEANUP_TIMEOUT_MS = 1_000;
 const SURFACE_METRIC_TOLERANCE = 10;
+export {MAX_CLIPBOARD_DATA_URL_CHARS};
 
 function codedError(code, message, cause) {
   const error = new Error(message, cause === undefined ? undefined : {cause});
@@ -40,6 +42,10 @@ function isUserCanceledDownload(error) {
     || text.includes('user cancel')
     || text.includes('canceled by the user')
     || text.includes('cancelled by the user');
+}
+
+export function isMessageTooLarge(error) {
+  return /message length|maximum allowed length/i.test(`${error?.message ?? error ?? ''}`);
 }
 
 function responseValue(response) {
@@ -87,13 +93,6 @@ function assertSurfaceInvariant(prepared, current) {
     error.details = changes.join('，');
     throw error;
   }
-}
-
-/** 滚动表面顶部相对 window 顶部的偏移；两者相同时为 0。 */
-function visibleTopInset(metrics) {
-  const viewportTop = Number.isFinite(metrics?.viewport?.top) ? metrics.viewport.top : 0;
-  const visibleTop = Number.isFinite(metrics?.visible?.top) ? metrics.visible.top : viewportTop;
-  return visibleTop - viewportTop;
 }
 
 function defaultTimestamp(date = new Date()) {
@@ -428,8 +427,30 @@ export async function saveComposition(request, deps) {
 export async function copyComposition(request, deps) {
   const {sendOffscreen, sendTab} = compositionDeps(deps);
   const {taskId, tabId} = request;
-  const exported = responseValue(await sendOffscreen(makeMessage(MESSAGE.COMPOSER_EXPORT, taskId)));
-  responseValue(await sendTab(tabId, makeMessage(MESSAGE.CLIPBOARD_WRITE, taskId, {dataUrl: exported.dataUrl})));
+  let exported;
+  try {
+    exported = responseValue(await sendOffscreen(makeMessage(MESSAGE.COMPOSER_EXPORT, taskId)));
+  } catch (error) {
+    if (isMessageTooLarge(error)) {
+      throw codedError(ERROR_CODE.COPY_TOO_LARGE, '截图过大，无法复制到剪贴板，请改用「保存」', error);
+    }
+    throw error;
+  }
+  const {dataUrl} = exported;
+  if (typeof dataUrl !== 'string') throw codedError(ERROR_CODE.CAPTURE_FAILED, '截图数据无效');
+  // 整张 PNG 的 dataURL 走消息通道，超长图会超过 Chrome 的序列化上限并只报
+  // 「截图失败」。提前拦下并引导用户保存，避免白等一次失败。
+  if (dataUrl.length > MAX_CLIPBOARD_DATA_URL_CHARS) {
+    throw codedError(ERROR_CODE.COPY_TOO_LARGE, '截图过大，无法复制到剪贴板，请改用「保存」');
+  }
+  try {
+    responseValue(await sendTab(tabId, makeMessage(MESSAGE.CLIPBOARD_WRITE, taskId, {dataUrl})));
+  } catch (error) {
+    if (isMessageTooLarge(error)) {
+      throw codedError(ERROR_CODE.COPY_TOO_LARGE, '截图过大，无法复制到剪贴板，请改用「保存」', error);
+    }
+    throw error;
+  }
   responseValue(await sendOffscreen(makeMessage(MESSAGE.COMPOSER_RELEASE, taskId)));
   return {copied: true};
 }

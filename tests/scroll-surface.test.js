@@ -66,6 +66,7 @@ test('adapts an internal scroll container and restores its locked state exactly'
       maxScrollTop: 700,
       viewport: {left: 102, top: 53, width: 300, height: 200},
       visible: {left: 102, top: 53, width: 300, height: 200},
+      overlayInset: 0,
       window: {width: 1000, height: 700}
     });
     assert.deepEqual(surface.toContentPoint(122, 73), {x: 50, y: 60});
@@ -103,6 +104,224 @@ test('clips the visible area of a container that extends past the window', () =>
     // 拖拽点同样只能落在「容器 ∩ 窗口」内，否则会框出永远截不到的区域
     assert.deepEqual(surface.clampClientPoint(-10, -10), {x: 0, y: 56});
     assert.deepEqual(surface.clampClientPoint(2000, 2000), {x: 1000, y: 705});
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test('excludes a fixed top navigation from the pointer range without shrinking visible', () => {
+  const page = {
+    scrollWidth: 1000, scrollHeight: 3000,
+    clientWidth: 1000, clientHeight: 700,
+    style: {scrollBehavior: ''}
+  };
+  const header = {
+    style: {},
+    getBoundingClientRect: () => ({left: 0, top: 0, right: 1000, bottom: 90, width: 1000, height: 90})
+  };
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    innerWidth: globalThis.innerWidth,
+    innerHeight: globalThis.innerHeight,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY
+  };
+  Object.assign(globalThis, {
+    document: {scrollingElement: page, querySelectorAll: () => [header]},
+    getComputedStyle: element => element === header
+      ? {position: 'fixed', visibility: 'visible', display: 'block', opacity: '1'}
+      : {position: 'static'},
+    innerWidth: 1000, innerHeight: 700, scrollX: 0, scrollY: 0
+  });
+
+  try {
+    const surface = createSurface(page);
+    const metrics = surface.getMetrics();
+    assert.deepEqual(metrics.viewport, {left: 0, top: 0, width: 1000, height: 700});
+    // visible 仍表示 captureVisibleTab 能截到的完整视口；导航高度单独记录。
+    // 截图时导航会被隐藏，若把它从 visible 扣掉，隐藏后 visible 会突变。
+    assert.deepEqual(metrics.visible, {left: 0, top: 0, width: 1000, height: 700});
+    assert.equal(metrics.overlayInset, 90);
+    // 指针也不能落在导航上，否则选区会从被导航盖住的内容开始。
+    assert.deepEqual(surface.clampClientPoint(10, 10), {x: 10, y: 90});
+    assert.deepEqual(surface.clampClientPoint(10, 500), {x: 10, y: 500});
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test('full-screen fixed layout shells are not mistaken for a top navigation', () => {
+  const page = {
+    scrollWidth: 1000, scrollHeight: 3000,
+    clientWidth: 1000, clientHeight: 700,
+    style: {scrollBehavior: ''}
+  };
+  const shell = {
+    style: {},
+    getBoundingClientRect: () => ({left: 0, top: 0, right: 1000, bottom: 700, width: 1000, height: 700})
+  };
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    innerWidth: globalThis.innerWidth,
+    innerHeight: globalThis.innerHeight,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY
+  };
+  Object.assign(globalThis, {
+    document: {scrollingElement: page, querySelectorAll: () => [shell]},
+    getComputedStyle: element => element === shell
+      ? {position: 'fixed', visibility: 'visible', display: 'block', opacity: '1'}
+      : {position: 'static'},
+    innerWidth: 1000, innerHeight: 700, scrollX: 0, scrollY: 0
+  });
+
+  try {
+    const metrics = createSurface(page).getMetrics();
+    // 全屏壳若被当成导航，可见区只剩 1px，分帧会变成几千帧并超时。
+    assert.deepEqual(metrics.visible, {left: 0, top: 0, width: 1000, height: 700});
+    assert.equal(metrics.overlayInset, 0);
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test('ignores a sticky header that is not pinned to the top', () => {
+  const page = {
+    scrollWidth: 1000, scrollHeight: 3000,
+    clientWidth: 1000, clientHeight: 700,
+    style: {scrollBehavior: ''}
+  };
+  const header = {
+    style: {},
+    getBoundingClientRect: () => ({left: 0, top: 200, right: 1000, bottom: 260, width: 1000, height: 60})
+  };
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    innerWidth: globalThis.innerWidth,
+    innerHeight: globalThis.innerHeight,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY
+  };
+  Object.assign(globalThis, {
+    document: {scrollingElement: page, querySelectorAll: () => [header]},
+    getComputedStyle: element => element === header
+      ? {position: 'sticky', top: '0px', visibility: 'visible', display: 'block', opacity: '1'}
+      : {position: 'static'},
+    innerWidth: 1000, innerHeight: 700, scrollX: 0, scrollY: 0
+  });
+
+  try {
+    const metrics = createSurface(page).getMetrics();
+    assert.deepEqual(metrics.visible, {left: 0, top: 0, width: 1000, height: 700});
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test('包含滚动表面的 fixed 应用壳不会被当成顶部导航', () => {
+  const page = {
+    scrollWidth: 1000, scrollHeight: 3000,
+    clientWidth: 1000, clientHeight: 700,
+    style: {scrollBehavior: ''}
+  };
+  const shell = {
+    style: {},
+    contains: element => element === page,
+    getBoundingClientRect: () => ({left: 0, top: 0, right: 1000, bottom: 80, width: 1000, height: 80})
+  };
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    innerWidth: globalThis.innerWidth,
+    innerHeight: globalThis.innerHeight,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY
+  };
+  Object.assign(globalThis, {
+    document: {scrollingElement: page, querySelectorAll: () => [shell]},
+    getComputedStyle: () => ({position: 'fixed', visibility: 'visible', display: 'block', opacity: '1'}),
+    innerWidth: 1000, innerHeight: 700, scrollX: 0, scrollY: 0
+  });
+
+  try {
+    const metrics = createSurface(page).getMetrics();
+    assert.equal(metrics.overlayInset, 0);
+    assert.deepEqual(metrics.visible, {left: 0, top: 0, width: 1000, height: 700});
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test('水平完全在可见区外的 fixed 抽屉不遮挡选区', () => {
+  const page = {
+    scrollWidth: 1000, scrollHeight: 3000,
+    clientWidth: 1000, clientHeight: 700,
+    style: {scrollBehavior: ''}
+  };
+  const drawer = {
+    style: {},
+    getBoundingClientRect: () => ({left: 1000, top: 0, right: 1600, bottom: 100, width: 600, height: 100})
+  };
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    innerWidth: globalThis.innerWidth,
+    innerHeight: globalThis.innerHeight,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY
+  };
+  Object.assign(globalThis, {
+    document: {scrollingElement: page, querySelectorAll: () => [drawer]},
+    getComputedStyle: () => ({position: 'fixed', visibility: 'visible', display: 'block', opacity: '1'}),
+    innerWidth: 1000, innerHeight: 700, scrollX: 0, scrollY: 0
+  });
+
+  try {
+    const metrics = createSurface(page).getMetrics();
+    assert.equal(metrics.overlayInset, 0);
+    assert.deepEqual(metrics.visible, {left: 0, top: 0, width: 1000, height: 700});
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test('多层吸顶导航按堆叠高度累计遮挡区', () => {
+  const page = {
+    scrollWidth: 1000, scrollHeight: 3000,
+    clientWidth: 1000, clientHeight: 700,
+    style: {scrollBehavior: ''}
+  };
+  const primary = {
+    style: {},
+    getBoundingClientRect: () => ({left: 0, top: 0, right: 1000, bottom: 59, width: 1000, height: 59})
+  };
+  const toolbar = {
+    style: {},
+    getBoundingClientRect: () => ({left: 0, top: 56, right: 1000, bottom: 108, width: 1000, height: 52})
+  };
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    innerWidth: globalThis.innerWidth,
+    innerHeight: globalThis.innerHeight,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY
+  };
+  Object.assign(globalThis, {
+    document: {scrollingElement: page, querySelectorAll: () => [toolbar, primary]},
+    getComputedStyle: element => element === toolbar
+      ? {position: 'sticky', top: '56px', visibility: 'visible', display: 'block', opacity: '1'}
+      : {position: 'fixed', visibility: 'visible', display: 'block', opacity: '1'},
+    innerWidth: 1000, innerHeight: 700, scrollX: 0, scrollY: 0
+  });
+
+  try {
+    const surface = createSurface(page);
+    assert.equal(surface.getMetrics().overlayInset, 108);
+    assert.deepEqual(surface.clampClientPoint(10, 10), {x: 10, y: 108});
   } finally {
     Object.assign(globalThis, previous);
   }
@@ -361,6 +580,40 @@ test('格式选择同步选中态，且截图期间整体隐藏扩展 UI', () =>
     globalThis.innerWidth = previousWidth;
     globalThis.innerHeight = previousHeight;
   }
+});
+
+test('选区绘制夹紧到扣除顶部导航后的可见区', () => {
+  class FakeElement {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.style = {};
+      this.listeners = {};
+      this.dataset = {};
+    }
+    append(...children) { this.children.push(...children); }
+    addEventListener(type, listener) { this.listeners[type] = listener; }
+    setAttribute(name, value) { (this.attributes ??= {})[name] = String(value); }
+    getAttribute(name) { return this.attributes?.[name] ?? null; }
+    attachShadow() { this.attachedShadow = new FakeElement('#shadow-root'); return this.attachedShadow; }
+    getBoundingClientRect() { return {width: 240, height: 70}; }
+    remove() {}
+  }
+  const fakeDocument = {documentElement: new FakeElement('html'), createElement: tag => new FakeElement(tag)};
+  const ui = createSelectionUI({}, fakeDocument);
+  const selection = ui.host.attachedShadow.children.find(child => child.className === 'selection');
+
+  // 顶部已滚出可见区：上边框贴到可见区顶部（导航下方），高度裁到剩余部分。
+  ui.showSelection({left: 0, top: -50, right: 100, bottom: 100},
+    {left: 0, top: 60, width: 100, height: 100});
+  assert.equal(selection.style.display, 'block');
+  assert.equal(selection.style.top, '60px');
+  assert.equal(selection.style.height, '40px');
+
+  // 选区完全在可见区上方：不再画一条贴顶的边框。
+  ui.showSelection({left: 0, top: -100, right: 100, bottom: 50},
+    {left: 0, top: 60, width: 100, height: 100});
+  assert.equal(selection.style.display, 'none');
 });
 
 test('菜单各阶段首次出现时定位到指针旁，越界时翻转夹紧', () => {

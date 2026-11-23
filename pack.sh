@@ -44,10 +44,10 @@ powershell -NoProfile -Command "Compress-Archive -Path '$(WIN "$STAGE")\\*' -Des
 echo "OK  $OUT_ZIP  （Chrome 应用商店上架用）"
 
 # 3) CRX（Chrome --pack-extension 签名）
-PARENT_WIN=$(WIN "$(dirname "$PWD")")
-BASE=$(basename "$PWD")
-# 先删掉上一次的产物，避免 Chrome 失败时把陈旧文件误报为成功
-rm -f "$(dirname "$PWD")/$BASE.crx" "$(dirname "$PWD")/$BASE.pem" "$OUT_CRX"
+# 与 ZIP 一样只签干净的 STAGE 目录：签源目录会把 tests/、文档、旧产物和根目录
+# 杂物一起打进 CRX，导致内部版与上架版内容不一致。
+# Chrome 按被签目录的路径输出 <目录>.crx / <目录>.pem，签完再搬走产物。
+rm -f "$STAGE.crx" "$STAGE.pem" "$OUT_CRX"
 
 KEY_ARGS=()
 if [ -f "$KEY_FILE" ]; then
@@ -61,16 +61,16 @@ if [ -f "$KEY_FILE" ]; then
 fi
 
 "$CHROME" \
-  --pack-extension="$(WIN "$PWD")" \
+  --pack-extension="$(WIN "$STAGE")" \
   --no-message-box \
   ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} >/dev/null 2>&1 || true
 sleep 2
 
-if [ -f "$(dirname "$PWD")/$BASE.crx" ]; then
-  mv -f "$(dirname "$PWD")/$BASE.crx" "$OUT_CRX"
+if [ -f "$STAGE.crx" ]; then
+  mv -f "$STAGE.crx" "$OUT_CRX"
 fi
 # Chrome 生成的新私钥收拢到约定位置（扩展目录之外）
-NEW_KEY="$(dirname "$PWD")/$BASE.pem"
+NEW_KEY="$STAGE.pem"
 if [ -f "$NEW_KEY" ] && [ ! -f "$KEY_FILE" ]; then
   mv -f "$NEW_KEY" "$KEY_FILE"
   echo "OK  $KEY_FILE  （新生成的扩展 ID 私钥，请妥善保管）"
@@ -82,7 +82,7 @@ if [ -f "$OUT_CRX" ]; then
   echo "OK  $OUT_CRX  （内部分发用，$(wc -c < "$OUT_CRX") 字节）"
 else
   echo "FAIL CRX 打包失败（Chrome 未生成文件）" >&2
-  echo "  排查：确认私钥路径有效、Chrome 未在运行、扩展目录不含 *.pem" >&2
+  echo "  排查：确认私钥路径有效、Chrome 未在运行" >&2
   echo "  手动方式：chrome://extensions → 开发者模式 →「打包扩展程序」" >&2
   exit 1
 fi

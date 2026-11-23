@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  CAPTURE_INTERVAL_MS, copyComposition, createCaptureGate, discardComposition, runCapture, saveComposition
+  CAPTURE_INTERVAL_MS, copyComposition, createCaptureGate, discardComposition, MAX_CLIPBOARD_DATA_URL_CHARS,
+  runCapture, saveComposition
 } from '../src/background/capture-controller.js';
 import {
-  createCaptureCoordinator, createChromeCaptureDeps, createHighQualitySessionManager,
+  COMPOSITION_GONE_MESSAGE, createCaptureCoordinator, createChromeCaptureDeps, createHighQualitySessionManager,
   createOffscreenInitializer, ERROR_MESSAGES, registerServiceWorker
 } from '../src/background/service-worker.js';
 import {ERROR_CODE, MESSAGE} from '../src/shared/protocol.js';
@@ -208,6 +209,52 @@ test('用户选择复制到剪贴板：导出 PNG 交给页面写入并释放画
   const write = messages.find(message => message.type === MESSAGE.CLIPBOARD_WRITE);
   assert.deepEqual(write.payload, {dataUrl: 'data:image/png;base64,AAAA'});
   assert.equal(events.includes('download'), false);
+});
+
+test('复制超大图时提示改用保存，不把 dataURL 塞进消息通道', async () => {
+  const harness = makeHarness();
+  const hugeDataUrl = `data:image/png;base64,${'A'.repeat(MAX_CLIPBOARD_DATA_URL_CHARS)}`;
+  const sendTabCalls = [];
+  harness.deps.sendOffscreen = async message => message.type === MESSAGE.COMPOSER_EXPORT
+    ? {ok: true, dataUrl: hugeDataUrl}
+    : {ok: true};
+  harness.deps.sendTab = async (tabId, message) => { sendTabCalls.push(message); return {ok: true}; };
+
+  await assert.rejects(
+    copyComposition({taskId: 'task-huge', tabId: 7}, harness.deps),
+    error => error.code === ERROR_CODE.COPY_TOO_LARGE
+  );
+  assert.deepEqual(sendTabCalls, []);
+  assert.equal(harness.events.includes('composerRelease'), false);
+});
+
+test('消息通道拒绝超长消息时映射为复制过大', async () => {
+  const harness = makeHarness();
+  harness.deps.sendTab = async () => {
+    throw new Error('Message length exceeded maximum allowed length.');
+  };
+
+  await assert.rejects(
+    copyComposition({taskId: 'task-copy', tabId: 7}, harness.deps),
+    error => error.code === ERROR_CODE.COPY_TOO_LARGE
+  );
+  assert.equal(harness.events.includes('composerRelease'), false);
+});
+
+test('导出阶段消息过长同样映射为复制过大，不误报截图失败', async () => {
+  const harness = makeHarness();
+  harness.deps.sendOffscreen = async message => {
+    if (message.type === MESSAGE.COMPOSER_EXPORT) {
+      throw new Error('Message length exceeded maximum allowed length.');
+    }
+    return {ok: true};
+  };
+
+  await assert.rejects(
+    copyComposition({taskId: 'task-copy', tabId: 7}, harness.deps),
+    error => error.code === ERROR_CODE.COPY_TOO_LARGE
+  );
+  assert.equal(harness.events.includes('composerRelease'), false);
 });
 
 test('剪贴板写入失败时保留中文错误且不释放画布（由上层决定丢弃）', async () => {
@@ -418,6 +465,17 @@ test('高清会话串行读写每个标签页的缩放，可取消未截图的�
   // 非法原缩放值直接忽略，不写 zoom。
   calls.length = 0;
   await sessions.restore(7, undefined);
+  assert.deepEqual(calls, []);
+});
+
+test('读取不到原始缩放时不放大页面，避免永久停在 150%', async () => {
+  const calls = [];
+  const sessions = createHighQualitySessionManager({
+    getZoom: async () => Number.NaN,
+    setZoom: async (tabId, factor) => { calls.push(['setZoom', tabId, factor]); }
+  });
+
+  await assert.rejects(sessions.enable(7), /缩放/);
   assert.deepEqual(calls, []);
 });
 
@@ -924,6 +982,26 @@ test('离屏文档被回收时 sendOffscreen 自动重建并重试一次', async
   assert.equal(alive, true);
 });
 
+test('离屏消息体过大时不重置离屏文档，避免销毁仍可保存的画布', async () => {
+  let attempts = 0;
+  let resets = 0;
+  const chromeApi = {
+    runtime: {
+      sendMessage: async () => {
+        attempts += 1;
+        throw new Error('Message length exceeded maximum allowed length.');
+      }
+    }
+  };
+  const prepare = async () => {};
+  prepare.reset = async () => { resets += 1; };
+  const deps = createChromeCaptureDeps(chromeApi, {prepareEnvironment: prepare});
+
+  await assert.rejects(deps.sendOffscreen({type: 'COMPOSER_EXPORT'}), /Message length/);
+  assert.equal(attempts, 1, '消息过大不应重试');
+  assert.equal(resets, 0, '消息过大不应重建离屏文档');
+});
+
 test('错误提示带上失败阶段与原始原因，便于定位', async () => {
   let runtimeListener;
   const sent = [];
@@ -1038,10 +1116,58 @@ test('CAPTURE_REQUEST 完成后由 CAPTURE_SAVE 保存，compositions 只消费�
   // 同一任务不能重复消费
   const again = send({type: MESSAGE.CAPTURE_SAVE, taskId: 'task-1', payload: {format: 'png'}});
   assert.deepEqual(again, [{ok: false, code: ERROR_CODE.STALE_TASK,
-    message: ERROR_MESSAGES[ERROR_CODE.STALE_TASK]}]);
+    message: COMPOSITION_GONE_MESSAGE}]);
   // 登记表可能因 Service Worker 重启而丢失；此时要顺手释放离屏旧会话，否则下次截图永久 stale
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.ok(calls.some(([name, type]) => name === 'offscreen' && type === MESSAGE.COMPOSER_ABORT));
+});
+
+test('复制超限后保留离屏画布，用户可直接改用保存', async () => {
+  let runtimeListener;
+  const calls = [];
+  const chromeApi = {
+    action: {onClicked: {addListener() {}}},
+    runtime: {
+      onMessage: {addListener(listener) { runtimeListener = listener; }},
+      sendMessage: async message => {
+        calls.push(['offscreen', message.type]);
+        if (message.type === MESSAGE.COMPOSER_EXPORT) {
+          return {ok: false, code: ERROR_CODE.COPY_TOO_LARGE, message: 'too large'};
+        }
+        if (message.type === MESSAGE.COMPOSER_FINISH) return {ok: true, objectUrl: 'blob:shot'};
+        return {ok: true};
+      }
+    },
+    tabs: {
+      query: async () => [{id: 7}],
+      sendMessage: async () => ({ok: true}),
+      captureVisibleTab: async () => 'data:png'
+    },
+    downloads: {download: async options => { calls.push(['download', options.filename]); return 1; }}
+  };
+  registerServiceWorker(chromeApi, async () => ({composed: true}), {error() {}});
+  const send = payload => {
+    const responses = [];
+    runtimeListener({source: 'longshot', ...payload},
+      {tab: {id: 7, windowId: 3}}, response => responses.push(response));
+    return responses;
+  };
+
+  send({type: MESSAGE.CAPTURE_REQUEST, taskId: 'task-copy', payload: {selection}});
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  const copied = send({type: MESSAGE.CAPTURE_COPY, taskId: 'task-copy'});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(copied[0].ok, false);
+  assert.equal(copied[0].code, ERROR_CODE.COPY_TOO_LARGE);
+  assert.equal(calls.some(([name, type]) => name === 'offscreen' && type === MESSAGE.COMPOSER_ABORT), false,
+    '复制超限不应丢弃画布');
+
+  const saved = send({type: MESSAGE.CAPTURE_SAVE, taskId: 'task-copy', payload: {format: 'png'}});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(saved[0].ok, true);
+  assert.match(saved[0].filename, /^longshot-.*\.png$/);
+  assert.ok(calls.some(([name]) => name === 'download'));
 });
 
 test('CAPTURE_DISCARD 释放离屏画布且拒绝其他标签页', async () => {
@@ -1067,7 +1193,7 @@ test('CAPTURE_DISCARD 释放离屏画布且拒绝其他标签页', async () => {
   await new Promise(resolve => setTimeout(resolve, 5));
 
   assert.deepEqual(send({type: MESSAGE.CAPTURE_DISCARD, taskId: 'task-1'}, {id: 99}),
-    [{ok: false, code: ERROR_CODE.STALE_TASK, message: ERROR_MESSAGES[ERROR_CODE.STALE_TASK]}]);
+    [{ok: false, code: ERROR_CODE.STALE_TASK, message: COMPOSITION_GONE_MESSAGE}]);
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(calls.includes(MESSAGE.COMPOSER_ABORT), false, '其他标签页不得释放他人画布');
 
@@ -1164,6 +1290,12 @@ test('service worker 将 CANCEL 转为对应任务的 AbortSignal', async () => 
   );
   await new Promise(resolve => setTimeout(resolve, 0));
 
-  assert.deepEqual(cancelResponses, [{ok: true}]);
+  assert.deepEqual(cancelResponses, [{ok: true, cancelled: true}]);
+  const staleResponses = [];
+  runtimeListener(
+    {source: 'longshot', type: MESSAGE.CANCEL, taskId: 'task-other'},
+    {}, response => staleResponses.push(response)
+  );
+  assert.deepEqual(staleResponses, [{ok: true, cancelled: false}]);
   assert.equal(responses[0].code, ERROR_CODE.CANCELLED);
 });

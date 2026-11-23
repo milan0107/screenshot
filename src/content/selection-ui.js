@@ -24,6 +24,19 @@ const VIEWPORT_MARGIN = 8;
 /** 无指针锚点时的停靠边距（右上角）。 */
 const PANEL_DOCK_MARGIN = 16;
 
+/** 选区实际可用的可见区：视口 ∩ 窗口，再扣除顶部固定导航遮挡。 */
+function contentVisible(metrics) {
+  const visible = metrics.visible ?? metrics.viewport;
+  const inset = Math.min(Math.max(0, metrics.overlayInset ?? 0),
+    Math.max(0, visible.height - 1));
+  return {
+    left: visible.left,
+    top: visible.top + inset,
+    width: visible.width,
+    height: Math.max(1, visible.height - inset)
+  };
+}
+
 /**
  * 菜单以指针为锚点：出现在指针**右下方**（左边缘对齐光标，顶边在光标下方 8px），
  * 右/下放不下时向左/上翻转，最终夹紧到视口内。与指针保留 CONTROL_GAP。
@@ -311,15 +324,19 @@ export function createSelectionUI(callbacks, ownerDocument = document) {
   return {
     host,
 
-    showSelection(rect, viewport) {
-      const visible = {
-        left: Math.max(rect.left, viewport.left),
-        top: Math.max(rect.top, viewport.top),
-        right: Math.min(rect.right, viewport.left + viewport.width),
-        bottom: Math.min(rect.bottom, viewport.top + viewport.height)
+    showSelection(rect, visible) {
+      const clipped = {
+        left: Math.max(rect.left, visible.left),
+        top: Math.max(rect.top, visible.top),
+        right: Math.min(rect.right, visible.left + visible.width),
+        bottom: Math.min(rect.bottom, visible.top + visible.height)
       };
+      if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) {
+        selection.style.display = 'none';
+        return;
+      }
       selection.style.display = 'block';
-      applyRect(selection, visible);
+      applyRect(selection, clipped);
     },
 
     /** 框选结束后显示 8 个调整手柄；再次拖拽或取消时收起。 */
@@ -397,6 +414,7 @@ export function createSelectionController({
   document: ownerDocument,
   randomUUID,
   sendMessage,
+  cancelCapture,
   requestAnimationFrame: requestFrame,
   cancelAnimationFrame: cancelFrame,
   onCaptureRequested,
@@ -428,9 +446,20 @@ export function createSelectionController({
     }
     if (state.taskId) {
       const type = state.composed ? MESSAGE.CAPTURE_DISCARD : MESSAGE.CANCEL;
-      if (state.composed || notify) {
+      // 保存/复制进行中（busy && composed）不能发 DISCARD：后台已把该任务从
+      // compositions 移除，这条消息会走「无主会话」分支广播 COMPOSER_ABORT，
+      // 撤销正在被下载的 blob URL，导致本次截图丢失。动作结束后它自己会
+      // RELEASE/ABORT 收尾，失败时后台也会补一次 ABORT。
+      const actionInFlight = state.busy && state.composed;
+      if (!actionInFlight && (state.composed || notify)) {
         try {
-          Promise.resolve(sendMessage(makeMessage(type, state.taskId))).catch(() => {});
+          // CANCEL 走 capture handler 的快速通道：后台明确回答
+          // cancelled=false 时可以立即本地解锁，不必等 120s 看门狗。
+          if (type === MESSAGE.CANCEL && typeof cancelCapture === 'function') {
+            cancelCapture(state.taskId);
+          } else {
+            Promise.resolve(sendMessage(makeMessage(type, state.taskId))).catch(() => {});
+          }
         } catch {
           // The selection UI can still be removed when the background is unavailable.
         }
@@ -508,7 +537,7 @@ export function createSelectionController({
       if (!state.surface || !state.start || !state.end || !state.ui) return;
       state.selection = normalizeRect(state.start, state.end);
       const metrics = state.surface.getMetrics();
-      const {viewport} = metrics;
+      const visible = contentVisible(metrics);
       const topLeft = toClientPoint({x: state.selection.left, y: state.selection.top}, metrics);
       const bottomRight = toClientPoint({x: state.selection.right, y: state.selection.bottom}, metrics);
       state.ui.showSelection({
@@ -516,7 +545,7 @@ export function createSelectionController({
         top: topLeft.y,
         right: bottomRight.x,
         bottom: bottomRight.y
-      }, viewport);
+      }, visible);
     }
 
     function updateEndpoint(event) {
@@ -565,7 +594,7 @@ export function createSelectionController({
       const point = state.surface.clampClientPoint(state.lastClientPoint.x, state.lastClientPoint.y);
       // 容器被窗口裁掉一部分时，真正能碰到的上下边缘是「容器 ∩ 窗口」，
       // 用容器自身的 viewport 会让屏幕边缘那段触发区不可达。
-      const speed = edgeScrollSpeed(point.y, metrics.visible ?? metrics.viewport);
+      const speed = edgeScrollSpeed(point.y, contentVisible(metrics));
       // 只在指针朝该方向拖动时自动滚动：否则从顶部附近开始向下框选时，
       // 会立刻触发「向上滚动」，把起点以上的内容扩进选区。
       if (speed !== 0 && Math.sign(speed) === state.verticalDirection) {
@@ -609,7 +638,15 @@ export function createSelectionController({
       if (!selection || selection.width <= 0 || selection.height <= 0 || !surface) return;
       stopAutoScroll(state);
       state.dragging = false;
-      state.taskId = randomUUID();
+      let taskId;
+      try {
+        taskId = randomUUID();
+      } catch {
+        // 极端情况下 crypto 不可用；不能静默停在确认态。
+        onActionFailed?.('无法创建截图任务，请重试');
+        return;
+      }
+      state.taskId = taskId;
       state.busy = true;
       state.zoomManaged = state.highQuality === true;
       state.ui?.setVisible(false);
@@ -672,6 +709,15 @@ export function createSelectionController({
         return;
       }
       Promise.resolve(request).then(response => {
+        if (response?.ok !== true && response?.code === 'COPY_TOO_LARGE') {
+          // 复制超限时后台保留了离屏画布；收起菜单会让用户再也找不到
+          // 「保存」，所以这里恢复操作菜单并保留 taskId/composed。
+          state.busy = false;
+          state.ui?.setVisible(true);
+          state.ui?.showActions(menuAnchor());
+          onActionFailed?.(response.message ?? '截图过大，无法复制到剪贴板，请改用「保存」');
+          return;
+        }
         const succeeded = response?.ok === true;
         done();
         if (!succeeded) {
@@ -703,7 +749,10 @@ export function createSelectionController({
         }
         state.ui?.hidePanel();
         const target = ownerDocument.elementsFromPoint(event.clientX, event.clientY)
-          .find((element) => element !== state.ui.host);
+          // 提示条（capture feedback）盖在页面上但 pointer-events:none，
+          // elementsFromPoint 仍会返回它；不能把它当成滚动表面，否则会误判为整页。
+          .find(element => element !== state.ui.host
+            && element?.dataset?.longshotCapture === undefined);
         state.surface = createSurface(findScrollSurface(target));
         state.surface.lock();
         state.dragging = true;
@@ -782,7 +831,13 @@ export function createSelectionController({
         try {
           if (wantHighQuality) {
             const response = await sendMessage(makeMessage(MESSAGE.ENABLE_HIGH_QUALITY, null));
-            if (response?.ok !== true || !Number.isFinite(response.originalZoom)) return;
+            if (response?.ok !== true) return;
+            if (!Number.isFinite(response.originalZoom)) {
+              // 后台已把页面放大，却没拿到可恢复的原始缩放值：本地状态没有任何
+              // 路径会再恢复缩放，页面会永久停在 150%。立即按 1 倍回退。
+              await sendMessage(makeMessage(MESSAGE.DISABLE_HIGH_QUALITY, null, {restoreZoomTo: 1}));
+              return;
+            }
             if (active !== state) {
               await sendMessage(makeMessage(MESSAGE.DISABLE_HIGH_QUALITY, null, {
                 restoreZoomTo: response.originalZoom

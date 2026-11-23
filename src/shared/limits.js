@@ -1,5 +1,7 @@
 export const MAX_EDGE = 30000;
 export const MAX_PIXELS = 200_000_000;
+/** chrome.tabs.sendMessage 的序列化上限约 64MB；dataURL 为 ASCII，留一半余量。 */
+export const MAX_CLIPBOARD_DATA_URL_CHARS = 32 * 1024 * 1024;
 
 export function validateOutput(width, height) {
   width = Math.round(width);
